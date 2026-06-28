@@ -1,7 +1,8 @@
 # XiaoAI Agent Notes
 
-This directory contains the standalone on-device XiaoAI agent. Treat this file
-as working memory for future coding agents.
+This file complements [README.md](README.md). The README is the user-facing
+entry point; this document records engineering notes and invariants for future
+coding agents working on this repository.
 
 ## Device Audio Invariant
 
@@ -67,7 +68,7 @@ the speaker, keep the `armv7-unknown-linux-gnueabihf.2.25` target suffix.
 Known-good output:
 
 ```text
-xiaoai-agent/target/armv7-unknown-linux-gnueabihf/release/dodo-xiaoai-agent
+xiaoai-agent/target/armv7-unknown-linux-gnueabihf/release/xiaoai-agent
 ```
 
 The resulting binary is expected to be:

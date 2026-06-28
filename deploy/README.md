@@ -1,41 +1,35 @@
-# 小爱音箱 Pro 刷机教程
+# Xiaomi 智能音箱 Pro 刷机教程
 
 > [!IMPORTANT]
-> 本教程仅适用于 **小爱音箱 Pro（LX06）** 和 **Xiaomi 智能音箱 Pro（OH2P）** 这两款机型，**其他型号**的小爱音箱请勿直接使用！🚨
+> 本教程仅在 **Xiaomi 智能音箱 Pro（OH2P）** 上测试成功，**其他型号**没有测试，请自行承担刷机风险！🚨
 
 ### 准备条件
 
 - 小爱音箱
   - Xiaomi 智能音箱 Pro（OH2P）
-  - 小爱音箱 Pro（LX06）
 - 数据线
-  - Type-C（适用于新款小爱音箱 Pro，**无需拆机**）
-  - Micro USB（旧款小爱音箱 Pro 用这种，**需要拆机**）
+  - Type-C
 
 > [!NOTE]
 > 注意：数据线不能只是充电线，需要连接到电脑上能传输数据才行。
 
 ### 连接电脑
 
-新款的 Xiaomi 智能音箱 Pro 可以直接使用 Type-C 数据线通过音响底部的 Type-C 接口连接到电脑。
-
-旧款小爱音箱 Pro 需要先把音箱外壳拆下来（[参考步骤](https://www.52audio.com/archives/38303.html)），然后在主板左上角找到 Mico USB 的调试接口，使用 Mico USB 数据线连接到电脑。
-
-![](./images/mico-usb.jpg)
+Xiaomi 智能音箱 Pro 可以直接使用 Type-C 数据线通过音响底部的 Type-C 接口连接到电脑。
 
 ### 开始刷机
 
 > [!CAUTION]
 > 刷机有风险，操作需谨慎。刷机可能会造成设备失去保修资格，变砖无法运行等。请自行评估相关风险，一切后果自负！🚨
 
-首先，下载或自行制作[补丁固件](../packages/client-patch/README.md)，重命名为 `root_patched.squashfs`。
+首先，下载或自行制作[补丁固件](./client-patch/README.md)，重命名为 `root_patched.squashfs`。
 
 然后，下载刷机工具：https://androidmtk.com/download-amlogic-flash-tool
 
 把下载好的刷机工具文件夹解压到桌面，重命名为 `Amlogic_Flash_Tool_v6.0.0`
 
 > [!TIP]
-> 如果你是 macOS 系统，请到此处下载[刷机工具和使用教程](../packages/flash-tool/README.md)。
+> 如果你是 macOS 系统，请到此处下载[刷机工具和使用教程](./flash-tool/README.md)。
 
 ![](./images/driver.jpg)
 
@@ -95,7 +89,7 @@ ssh -o HostKeyAlgorithms=+ssh-rsa root@你的小爱音箱局域网IP地址
 > - 你设置的启动分区（boot0）是否和你刷写的系统分区（system0）一致（修改启动分区之后，需要 `saveenv` 才会保存生效）
 > - 你的电脑和小爱音箱是否处在同一网络环境下（可以更换路由器试试看）
 > - 你的内网防火墙是否屏蔽了 22 端口（SSH 默认连接端口）
-> - 如果你是自己构建的补丁固件，请检查 SSH 相关的 [patch](../packages/client-patch/patches/01-ssh.patch) 是否生效
+> - 如果你是自己构建的补丁固件，请检查 SSH 相关的 [patch](./client-patch/patches/01-ssh.patch) 是否生效
 
 ### 更新系统
 
@@ -118,6 +112,6 @@ fw_env -s boot_part boot1
 
 #### Q: 刷机之后，原来的小爱同学和设备操控还能正常使用吗？
 
-可以。本仓库发布的 patch 固件，对于原来的音响功能没有任何修改，一切如常。
+本项目会将原生小爱的麦克风输入静音，由 `xiaoai-agent` 接管语音对话流程，用来避免抢麦、抢答和小米云端控制冲突。蓝牙网关等非语音对话服务不应受到影响。
 
 唯一需要注意的是，patch 后的固件关闭了系统更新功能，你可以按照上面的教程随时切换回原厂系统，恢复系统更新。

@@ -1,0 +1,104 @@
+runtime:
+  kws_vpm_lib: /usr/lib/libvpm.so
+  kws_vpm_config_dir: /usr/share/mipns/vpm/json_segment
+  kws_pcm: noop
+  kws_sample_rate: 48000
+  kws_channels: 4
+  kws_bits_per_sample: 32
+  kws_frame_ms: 8
+  kws_period_size: 384
+  kws_buffer_size: 4096
+  kws_ref_channel_index: 3
+  kws_start_status: 6
+  acknowledge_text: ["在", "我在", "哎"]
+  session_idle_timeout_s: 20
+
+device:
+  tts_command: "/usr/sbin/tts_play.sh {text}"
+  play_url_command: "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/dodo-xiaoai-miplayer.log 2>&1 &"
+  stop_audio_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
+  pause_audio_command: "mphelper pause 2>/dev/null || true; for p in $(pidof miplayer 2>/dev/null); do kill -STOP \"$p\" 2>/dev/null || true; done"
+  resume_audio_command: "for p in $(pidof miplayer 2>/dev/null); do kill -CONT \"$p\" 2>/dev/null || true; done; mphelper play 2>/dev/null || true"
+  duck_audio_command: "amixer sget mysoftvol | awk -F'[][]' '/%/ {print $2; exit}' | tr -d '%' >/tmp/dodo-xiaoai-mysoftvol.before; amixer sset mysoftvol 25% >/dev/null 2>&1 || true"
+  unduck_audio_command: "v=$(cat /tmp/dodo-xiaoai-mysoftvol.before 2>/dev/null); if [ -n \"$v\" ]; then amixer sset mysoftvol \"${v}%\" >/dev/null 2>&1 || true; fi; rm -f /tmp/dodo-xiaoai-mysoftvol.before"
+  abort_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause 2>/dev/null || true"
+  led_enabled: true
+  led_listening: 3
+  led_user_speaking: 4
+  led_thinking: 2
+  led_speaking: 5
+
+capture:
+  pcm: vpm_asr
+  sample_rate: 16000
+  channels: 1
+  bits_per_sample: 16
+  period_size: 360
+  buffer_size: 1440
+  threshold: 0.006
+  mic_gain: 1.0
+  block_ms: 100
+  pre_roll_ms: 300
+  silence_ms: 800
+  min_speech_ms: 300
+  max_utterance_s: 12
+  cooldown_s: 0.7
+
+asr:
+  base_url: https://api.openai.com/v1
+  api_key: EMPTY
+  model: whisper-1
+  language: zh
+  prompt: ""
+  timeout_s: 30
+
+llm:
+  base_url: https://api.openai.com/v1
+  api_key: EMPTY
+  model: gpt-4o-mini
+  timeout_s: 35
+  max_tokens: 300
+  retries: 1
+  temperature: 0.5
+
+agent:
+  timezone: Asia/Shanghai
+  weather:
+    qweather_url: ""
+    default_location: ""
+    ip_lookup_url: https://ipapi.co/json/
+    timeout_s: 10
+
+mcp:
+  home_assistant:
+    enabled: false
+    url: http://homeassistant.local:8123/mcp_server/sse
+    token: ""
+    timeout_s: 10
+
+music:
+  enabled: false
+  provider: netease
+  interruption:
+    # pause, duck, or none. duck uses device.duck_audio_command / unduck_audio_command.
+    mode: pause
+  netease:
+    api_base_url: http://127.0.0.1:3300
+    auto_start: false
+    start_command: ["npx", "--yes", "@neteasecloudmusicapienhanced/api"]
+    login_mode: captcha
+    account: ""
+    phone: ""
+    password: ""
+    md5_password: ""
+    # Optional read-only seed cookie. Login refreshes are kept in memory and are not written back.
+    cookie_file: null
+    default_level: standard
+    timeout_s: 15
+    login_on_start: true
+  navidrome:
+    base_url: http://127.0.0.1:4533
+    username: ""
+    password: ""
+    api_version: 1.16.1
+    timeout_s: 15

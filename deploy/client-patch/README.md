@@ -3,7 +3,7 @@
 > [!CAUTION]
 > 刷机有风险，操作需谨慎。请勿下载使用不明来历的固件！
 
-小爱音箱 Pro 补丁固件制作流程：
+Xiaomi 智能音箱 Pro 补丁固件制作流程：
 
 - 固件提取（登录小米账号获取 OTA 链接）
 - 开启固化 SSH（支持自定义登录密码）
@@ -15,7 +15,6 @@
 你可以直接在 [Github Releases](https://github.com/idootop/open-xiaoai/releases) 页面下载打包好的固件：
 
 - [Xiaomi 智能音箱 Pro v1.58.6](https://github.com/idootop/open-xiaoai/releases/tag/OH2P_1.58.6)
-- [小爱音箱 Pro v1.94.13](https://github.com/idootop/open-xiaoai/releases/tag/LX06_1.94.13)
 
 > [!TIP]
 > 里面有两个文件，下载 `patched` 那个：
@@ -34,7 +33,6 @@
 > 当前支持的最新固件版本为：
 >
 > - Xiaomi 智能音箱 Pro 👉 [v1.58.6](https://github.com/idootop/open-xiaoai/releases/tag/OH2P_1.58.6)
-> - 小爱音箱 Pro 👉 [v1.94.13](https://github.com/idootop/open-xiaoai/releases/tag/LX06_1.94.13)
 >
 > 更新版本的固件可能存在变化，导致刷机失败，设备变砖，请自行评估风险。
 
@@ -51,8 +49,8 @@
 MI_USER=23333333
 MI_PASS=xxxxxxxxx
 
-# 你的小爱音箱名称/DID
-MI_DID=小爱音箱Pro
+# 你的 Xiaomi 智能音箱 Pro 名称/DID
+MI_DID=Xiaomi智能音箱Pro
 
 # 你的 SSH 登录密码（默认为 open-xiaoai）
 SSH_PASSWORD=open-xiaoai
@@ -74,10 +72,11 @@ SSH_PASSWORD=open-xiaoai
 
 ```shell
 # 克隆代码
-git clone https://github.com/idootop/open-xiaoai.git
+git clone https://github.com/stevenjoezhang/xiaoai-agent.git
 
 # 进入当前项目根目录
-cd packages/client-patch
+cd xiaoai-agent
+cd deploy/client-patch
 
 # 使用 Docker 进行构建
 docker run -it --rm \
@@ -100,10 +99,11 @@ docker run -it --rm \
 
 ```bash
 # 克隆代码
-git clone https://github.com/idootop/open-xiaoai.git
+git clone https://github.com/stevenjoezhang/xiaoai-agent.git
 
 # 进入当前项目根目录
-cd packages/client-patch
+cd xiaoai-agent
+cd deploy/client-patch
 
 # 安装依赖
 npm install

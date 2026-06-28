@@ -6,7 +6,6 @@ import * as stream from "node:stream";
 import { promisify } from "node:util";
 
 const kSupportedDevices = [
-  "LX06", // 小爱音箱 Pro
   "OH2P", // Xiaomi 智能音箱 Pro
 ];
 

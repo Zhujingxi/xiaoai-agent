@@ -37,7 +37,7 @@ use crate::monitor::kws::{KwsMonitor, KwsMonitorEvent};
 use crate::music::MusicService;
 
 #[derive(Debug, Parser)]
-#[command(name = "dodo-xiaoai-agent")]
+#[command(name = "xiaoai-agent")]
 #[command(about = "Standalone XiaoAI on-device agent: flexkws + cloud ASR + Rig agent")]
 struct Cli {
     #[arg(short, long, default_value = "/data/open-xiaoai/agent.yaml")]
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let mut kws = KwsMonitor::new();
     start_kws_monitor(&mut kws, config.runtime.clone(), kws_tx.clone()).await;
 
-    info!("dodo-xiaoai-agent ready");
+    info!("xiaoai-agent ready");
     device
         .blink_ready(config.device.led_listening, Duration::from_millis(250))
         .await;

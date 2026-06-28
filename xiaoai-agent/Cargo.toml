@@ -1,5 +1,5 @@
 [package]
-name = "dodo-xiaoai-agent"
+name = "xiaoai-agent"
 version = "0.1.0"
 edition = "2021"
 

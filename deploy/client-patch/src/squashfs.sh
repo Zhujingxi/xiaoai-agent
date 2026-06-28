@@ -37,8 +37,9 @@ MODEL=$(cat $BASE_DIR/assets/.model)
 IMAGE_MAX_SIZE=0
 if [ "$MODEL" = "OH2P" ]; then
     IMAGE_MAX_SIZE=$((0x02800000))
-elif [ "$MODEL" = "LX06" ]; then
-    IMAGE_MAX_SIZE=$((0x02800000))
+else
+    echo "❌ 暂不支持当前设备型号: $MODEL。本项目目前只在 OH2P 上测试成功。"
+    exit 1
 fi
 
 if command -v gstat >/dev/null 2>&1; then

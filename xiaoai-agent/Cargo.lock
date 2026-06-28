@@ -503,33 +503,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dodo-xiaoai-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "clap",
- "futures",
- "libloading",
- "md5",
- "rand 0.8.6",
- "reqwest 0.12.28",
- "rig-core",
- "rmcp",
- "serde",
- "serde_json",
- "serde_yaml",
- "shell-words",
- "sse-stream",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3105,6 +3078,33 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "xiaoai-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "futures",
+ "libloading",
+ "md5",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "rig-core",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "shell-words",
+ "sse-stream",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
 
 [[package]]
 name = "yoke"

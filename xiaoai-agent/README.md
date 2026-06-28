@@ -1,4 +1,4 @@
-# dodo-xiaoai-agent
+# xiaoai-agent
 
 Standalone XiaoAI on-device agent experiment.
 
@@ -27,7 +27,7 @@ The default config path on device is:
 /data/open-xiaoai/agent.yaml
 ```
 
-See [examples/agent.yaml](examples/agent.yaml).
+See [agent.example.yaml](agent.example.yaml).
 
 ## Current Notes
 

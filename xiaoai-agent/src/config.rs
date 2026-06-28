@@ -105,7 +105,7 @@ impl Default for DeviceConfig {
         Self {
             tts_command: "/usr/sbin/tts_play.sh {text}".to_string(),
             play_url_command:
-                "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/dodo-xiaoai-miplayer.log 2>&1 &"
+                "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &"
                     .to_string(),
             stop_audio_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
                 .to_string(),
@@ -116,10 +116,10 @@ impl Default for DeviceConfig {
                 "for p in $(pidof miplayer 2>/dev/null); do kill -CONT \"$p\" 2>/dev/null || true; done; mphelper play 2>/dev/null || true"
                     .to_string(),
             duck_audio_command:
-                "amixer sget mysoftvol | awk -F'[][]' '/%/ {print $2; exit}' | tr -d '%' >/tmp/dodo-xiaoai-mysoftvol.before; amixer sset mysoftvol 25% >/dev/null 2>&1 || true"
+                "amixer sget mysoftvol | awk -F'[][]' '/%/ {print $2; exit}' | tr -d '%' >/tmp/xiaoai-mysoftvol.before; amixer sset mysoftvol 25% >/dev/null 2>&1 || true"
                     .to_string(),
             unduck_audio_command:
-                "v=$(cat /tmp/dodo-xiaoai-mysoftvol.before 2>/dev/null); if [ -n \"$v\" ]; then amixer sset mysoftvol \"${v}%\" >/dev/null 2>&1 || true; fi; rm -f /tmp/dodo-xiaoai-mysoftvol.before"
+                "v=$(cat /tmp/xiaoai-mysoftvol.before 2>/dev/null); if [ -n \"$v\" ]; then amixer sset mysoftvol \"${v}%\" >/dev/null 2>&1 || true; fi; rm -f /tmp/xiaoai-mysoftvol.before"
                     .to_string(),
             abort_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause 2>/dev/null || true; ubus call mediaplayer media_control '{\"player\":\"mediaplayer\",\"action\":\"pause\",\"volume\":0}' 2>/dev/null || true; ubus call mediaplayer player_play_operation '{\"media\":\"app_ios\",\"action\":\"stop\"}' 2>/dev/null || true".to_string(),
             led_enabled: true,

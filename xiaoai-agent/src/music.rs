@@ -566,7 +566,7 @@ impl MusicService {
                 .append_pair("t", &token)
                 .append_pair("s", &salt)
                 .append_pair("v", &self.config.music.navidrome.api_version)
-                .append_pair("c", "dodo-edge")
+                .append_pair("c", "xiaoai-agent")
                 .append_pair("f", "json");
             for (key, value) in params {
                 pairs.append_pair(key, value);
@@ -605,7 +605,7 @@ impl MusicService {
             .append_pair("t", &token)
             .append_pair("s", &salt)
             .append_pair("v", &self.config.music.navidrome.api_version)
-            .append_pair("c", "dodo-edge")
+            .append_pair("c", "xiaoai-agent")
             .append_pair("f", "json")
             .append_pair("id", song_id);
         Ok(url.to_string())

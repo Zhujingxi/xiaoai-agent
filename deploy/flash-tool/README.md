@@ -21,10 +21,11 @@ brew install libusb-compat
 
 ```shell
 # 克隆代码
-git clone https://github.com/idootop/open-xiaoai.git
+git clone https://github.com/stevenjoezhang/xiaoai-agent.git
 
 # 进入当前项目根目录
-cd packages/flash-tool
+cd xiaoai-agent
+cd deploy/flash-tool
 
 # 授予可运行权限
 chmod +x ./flash

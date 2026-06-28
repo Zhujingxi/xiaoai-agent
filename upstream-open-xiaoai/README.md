@@ -56,23 +56,7 @@
 
 ## 快速开始
 
-> [!IMPORTANT]
-> 本教程仅适用于 **小爱音箱 Pro（LX06）** 和 **Xiaomi 智能音箱 Pro（OH2P）** 这两款机型，**其他型号**的小爱音箱请勿直接使用！🚨
-
-本项目由 Client 端 + Server 端两部分组成，你可以按照以下顺序运行该项目：
-
-1. 刷机更新小爱音箱补丁固件，开启并 SSH 连接到小爱音箱 👉 [教程](docs/flash.md)
-2. 在小爱音箱上安装运行 Client 端补丁程序 👉 [教程](packages/client-rust/README.md)
-3. 运行以下演示程序，体验小爱音箱的全新能力 ✨
-   - 👉 [小爱音箱 AI Bridge（小智](examples/bridge/README.md)）
-   - 👉 [小爱音箱自定义唤醒词](examples/kws/README.md)
-   - 👉 [小爱音箱接入 MiGPT（完美版）](examples/migpt/README.md)
-   - 👉 [小爱音箱接入 Gemini Live API](examples/gemini/README.md)
-   - 👉 [小爱音箱组立体声（支持不同型号机型）](examples/stereo/README.md)
-   - 👉 [小爱音箱接入 OpenClaw](https://github.com/coderzc/open-xiaoai-bridge/blob/main/README.md)
-
-
-以上皆为抛砖引玉，你也可以亲手编写自己想要的功能，一切由你定义！
+本目录只保留上游 Open-XiaoAI 的部分快照材料，用于说明来源和许可证。当前仓库的实际使用流程请从仓库根目录 [README.md](../README.md) 开始，固件制作与刷机请参考 [deploy/README.md](../deploy/README.md)。
 
 ## 相关项目
 
@@ -80,7 +64,7 @@
 > 技术的意义在于分享与共创。如果你打算或正在使用本项目做些有趣的事情，
 > 欢迎提交 PR 或 issue 分享你的项目和创意。✨
 
-如果你不想刷机，或者不是小爱音箱 Pro，下面的项目或许对你有用：
+如果你不想刷机，下面的项目或许对你有用：
 
 - https://github.com/idootop/mi-gpt
 - https://github.com/idootop/migpt-next
@@ -105,7 +89,7 @@
 2. **非官方声明**
    本项目由第三方开发者独立开发，与小米集团及其关联方（下称"权利方"）无任何隶属/合作关系，亦未获其官方授权/认可或技术支持。项目中涉及的商标、固件、云服务的所有权利归属小米集团。若权利方主张权益，使用者应立即主动停止使用并删除本项目。
 
-继续下载或运行本项目，即表示您已完整阅读并同意[用户协议](agreement.md)，否则请立即终止使用并彻底删除本项目。
+继续下载或运行本项目，即表示您已了解并自行承担相关风险，否则请立即终止使用并彻底删除本项目。
 
 ## License
 

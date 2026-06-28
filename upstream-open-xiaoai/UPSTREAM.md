@@ -11,14 +11,12 @@ Copied commit:
 Copied or adapted paths in this repository:
 
 - `LICENSE`
-- `README.md` as `OPEN_XIAOAI_README.md`
-- `agreement.md`
-- `docs/flash.md`
+- `README.md`
 - `docs/images/`
 - `packages/client-patch/` as `deploy/client-patch/`
 - `packages/flash-tool/` as `deploy/flash-tool/`
 
-This is a partial vendored snapshot for local DODO/XiaoAI integration work. It
+This is a partial vendored snapshot for local XiaoAI integration work. It
 keeps the firmware patch and flash tooling required to prepare a speaker for
 the standalone `xiaoai-agent`; the Open-XiaoAI client runtime itself is not
 vendored here.

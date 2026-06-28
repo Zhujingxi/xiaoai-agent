@@ -25,7 +25,7 @@ impl McpConnections {
 
         let client_info = ClientInfo::new(
             ClientCapabilities::default(),
-            Implementation::new("dodo-xiaoai-agent", env!("CARGO_PKG_VERSION")),
+            Implementation::new("xiaoai-agent", env!("CARGO_PKG_VERSION")),
         );
         let handler = McpClientHandler::new(client_info, tool_server);
         let service = if is_legacy_sse_url(&ha.url) {
