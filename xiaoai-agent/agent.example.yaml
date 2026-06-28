@@ -78,7 +78,7 @@ mcp:
 
 music:
   enabled: false
-  provider: netease
+  provider: navidrome
   interruption:
     # pause, duck, or none. duck uses device.duck_audio_command / unduck_audio_command.
     mode: pause

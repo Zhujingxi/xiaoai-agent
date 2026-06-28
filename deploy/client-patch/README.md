@@ -50,8 +50,6 @@ SSH_PASSWORD=open-xiaoai
 
 ### 1. 使用 Docker 打包固件（推荐）
 
-[![Docker Image Version](https://img.shields.io/docker/v/idootop/open-xiaoai?color=%23086DCD&label=docker%20image)](https://hub.docker.com/r/idootop/open-xiaoai)
-
 为了能够正常编译运行该项目，你需要安装以下依赖：
 
 - Docker：https://www.docker.com/get-started/
@@ -70,13 +68,16 @@ git clone https://github.com/stevenjoezhang/xiaoai-agent.git
 cd xiaoai-agent
 cd deploy/client-patch
 
-# 使用 Docker 进行构建
+# 构建当前仓库的打包镜像
+docker build --platform linux/amd64 -t xiaoai-agent-client-patch .
+
+# 使用当前仓库镜像进行构建
 docker run -it --rm \
     --platform linux/amd64 \
     --env-file $(pwd)/.env \
     -v $(pwd)/assets:/app/assets \
     -v $(pwd)/patches:/app/patches \
-    idootop/open-xiaoai:latest
+    xiaoai-agent-client-patch
 
 # ✅ 打包完成，固件文件已复制到 assets 目录...
 # /app/assets/mico_all_92db90ed6_1.88.197/root-patched.squashfs
@@ -88,6 +89,7 @@ docker run -it --rm \
 
 - Python 3.x：https://www.python.org/downloads/
 - Node.js 22.x: https://nodejs.org/zh-cn/download
+- squashfs-tools：macOS 可执行 `brew install squashfs`，Linux 请使用发行版包管理器安装 `squashfs-tools`
 
 ```bash
 # 克隆代码

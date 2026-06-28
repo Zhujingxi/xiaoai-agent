@@ -299,7 +299,7 @@ impl Default for MusicConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: "netease".to_string(),
+            provider: "navidrome".to_string(),
             interruption: MusicInterruptionConfig::default(),
             netease: NeteaseConfig::default(),
             navidrome: NavidromeConfig::default(),
