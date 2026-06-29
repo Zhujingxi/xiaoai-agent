@@ -390,8 +390,6 @@ impl Default for MusicInterruptionConfig {
 #[serde(default)]
 pub struct NeteaseConfig {
     pub api_base_url: String,
-    pub auto_start: bool,
-    pub start_command: Vec<String>,
     pub login_mode: String,
     pub account: String,
     pub phone: String,
@@ -407,12 +405,6 @@ impl Default for NeteaseConfig {
     fn default() -> Self {
         Self {
             api_base_url: "http://127.0.0.1:3300".to_string(),
-            auto_start: false,
-            start_command: vec![
-                "npx".to_string(),
-                "--yes".to_string(),
-                "@neteasecloudmusicapienhanced/api".to_string(),
-            ],
             login_mode: "captcha".to_string(),
             account: String::new(),
             phone: String::new(),

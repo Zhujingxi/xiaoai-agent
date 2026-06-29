@@ -84,9 +84,8 @@ music:
     # pause, duck, or none. duck uses device.duck_audio_command / unduck_audio_command.
     mode: pause
   netease:
+    # External Netease API service URL. The speaker does not start this service locally.
     api_base_url: http://127.0.0.1:3300
-    auto_start: false
-    start_command: ["npx", "--yes", "@neteasecloudmusicapienhanced/api"]
     login_mode: captcha
     account: ""
     phone: ""

@@ -1,4 +1,3 @@
-use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -6,7 +5,6 @@ use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::warn;
 use url::Url;
@@ -51,7 +49,6 @@ pub struct MusicService {
     device: Device,
     client: Client,
     state: Mutex<MusicState>,
-    netease_process_started: Mutex<bool>,
     netease_cookie: Mutex<Option<String>>,
 }
 
@@ -62,7 +59,6 @@ impl MusicService {
             device,
             client: Client::new(),
             state: Mutex::new(MusicState::default()),
-            netease_process_started: Mutex::new(false),
             netease_cookie: Mutex::new(None),
         })
     }
@@ -625,26 +621,10 @@ impl MusicService {
         {
             return Ok(());
         }
-        if !self.config.music.netease.auto_start {
-            anyhow::bail!("Netease API is not reachable");
-        }
-        let mut started = self.netease_process_started.lock().await;
-        if !*started {
-            let command = &self.config.music.netease.start_command;
-            anyhow::ensure!(!command.is_empty(), "music.netease.start_command is empty");
-            let mut cmd = Command::new(&command[0]);
-            cmd.args(&command[1..])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if let Ok(url) = Url::parse(&self.config.music.netease.api_base_url) {
-                if let Some(port) = url.port() {
-                    cmd.env("PORT", port.to_string());
-                }
-            }
-            cmd.spawn().context("failed to start Netease API")?;
-            *started = true;
-        }
-        Ok(())
+        anyhow::bail!(
+            "Netease API is not reachable at {}; run the API service externally and set music.netease.api_base_url",
+            self.config.music.netease.api_base_url
+        );
     }
 
     async fn read_cookie(&self) -> Option<String> {
