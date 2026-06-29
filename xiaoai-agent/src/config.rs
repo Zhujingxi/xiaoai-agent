@@ -183,6 +183,7 @@ pub struct AsrConfig {
     pub language: String,
     pub prompt: String,
     pub timeout_s: f64,
+    pub retries: u32,
 }
 
 impl Default for AsrConfig {
@@ -194,6 +195,7 @@ impl Default for AsrConfig {
             language: "zh".to_string(),
             prompt: String::new(),
             timeout_s: 30.0,
+            retries: 1,
         }
     }
 }

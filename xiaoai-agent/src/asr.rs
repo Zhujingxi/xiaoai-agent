@@ -3,6 +3,7 @@ use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::time::timeout;
+use tracing::warn;
 
 use crate::config::{timeout_duration, AsrConfig};
 use crate::vad::BYTES_PER_SAMPLE;
@@ -22,6 +23,25 @@ impl CloudAsr {
     }
 
     pub async fn transcribe_pcm(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {
+        let attempts = self.config.retries.saturating_add(1);
+        let mut last_error = None;
+
+        for attempt in 1..=attempts {
+            match self.transcribe_pcm_once(pcm, sample_rate).await {
+                Ok(text) => return Ok(text),
+                Err(err) => {
+                    if attempt < attempts {
+                        warn!("ASR attempt {attempt}/{attempts} failed: {err:?}");
+                    }
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("ASR request failed without attempts")))
+    }
+
+    async fn transcribe_pcm_once(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {
         let file = Part::bytes(wav_bytes(pcm, sample_rate))
             .file_name("speech.wav")
             .mime_str("audio/wav")?;

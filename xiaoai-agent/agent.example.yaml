@@ -51,6 +51,7 @@ asr:
   language: zh
   prompt: ""
   timeout_s: 30
+  retries: 1
 
 llm:
   base_url: https://api.openai.com/v1

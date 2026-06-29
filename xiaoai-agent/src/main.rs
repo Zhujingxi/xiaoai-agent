@@ -38,6 +38,9 @@ use crate::device::Device;
 use crate::monitor::kws::{KwsMonitor, KwsMonitorEvent};
 use crate::music::MusicService;
 
+const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
+const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，请稍后重试";
+
 #[derive(Debug, Parser)]
 #[command(name = "xiaoai-agent")]
 #[command(about = "Standalone XiaoAI on-device agent: flexkws + cloud ASR + Rig agent")]
@@ -210,10 +213,17 @@ async fn run_session(state: TurnState) -> anyhow::Result<()> {
         };
 
         state.device.show_led(led.led_thinking).await;
-        let text = state
+        let text = match state
             .asr
             .transcribe_pcm(&pcm, state.config.capture.sample_rate)
-            .await?;
+            .await
+        {
+            Ok(text) => text,
+            Err(err) => {
+                speak_service_error(&state.device, led, ASR_SERVICE_ERROR_PROMPT).await;
+                return Err(err.context("ASR failed after retries"));
+            }
+        };
         let command = text.trim();
         if command.is_empty() {
             info!("empty ASR result; ending session");
@@ -222,7 +232,13 @@ async fn run_session(state: TurnState) -> anyhow::Result<()> {
         }
         info!("USER_ASR text={command}");
 
-        let reply = state.agent.run_turn(command).await?;
+        let reply = match state.agent.run_turn(command).await {
+            Ok(reply) => reply,
+            Err(err) => {
+                speak_service_error(&state.device, led, LLM_SERVICE_ERROR_PROMPT).await;
+                return Err(err.context("LLM failed after retries"));
+            }
+        };
         state.device.shut_led(led.led_thinking).await;
         if reply.text.trim().is_empty() {
             continue;
@@ -234,6 +250,14 @@ async fn run_session(state: TurnState) -> anyhow::Result<()> {
             state.agent.reset_session("agent ended conversation").await;
             return Ok(());
         }
+    }
+}
+
+async fn speak_service_error(device: &Device, led: &DeviceConfig, text: &str) {
+    device.shut_led(led.led_thinking).await;
+    device.show_led(led.led_speaking).await;
+    if let Err(err) = device.speak(text).await {
+        warn!("failed to speak service error prompt: {err:?}");
     }
 }
 
