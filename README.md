@@ -16,8 +16,8 @@ https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 - 完全接管语音对话流程：为了避免和原生小爱同学抢麦、抢答或触发小米云端控制，本项目会将原生小爱的麦克风输入静音，真实麦克风音频由 `xiaoai-agent` 接管，使用音箱系统 TTS 命令播报回复。
 - 无需单独搭建服务器：Agent 直接运行在音箱上，不再依赖独立的 WebSocket 消息桥接层。
 - 复用设备原生音频能力：使用固件内置的常驻唤醒和 VPM 音频回调机制，音频体验完美；支持连续对话、VAD、中途打断、回声消除、播放时录音。
-- 支持自定义 ASR 和大模型服务：ASR 使用 OpenAI-compatible `POST /v1/audio/transcriptions` 接口；大模型也可以配置为兼容 OpenAI API 的服务。
 - 支持工具和设备控制：使用现代 Agent 框架支撑，内置时间、天气、Navidrome 音乐播放工具，并可通过 Home Assistant MCP 控制智能家居。
+- 支持 AirPlay 音频输出：音箱可以作为 AirPlay 音频接收端，播放来自 iPhone、iPad、Mac 等设备的音频流。
 - 保留音箱其它系统能力：麦克风输入会被 `xiaoai-agent` 接管，但蓝牙网关等非语音对话服务不受到影响，且 LED 指示灯动态可以自定义控制。
 
 ## 代码结构
@@ -80,7 +80,7 @@ brew install zig
 
 ### 4. 创建运行配置
 
-配置可能包含 API Key、Home Assistant Token 等敏感信息，请在编辑时注意保护。
+为了正常使用，需要准备 ASR 服务和大模型服务 API Key。可选配置包含 Home Assistant Token 等。
 
 ```bash
 cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
@@ -93,6 +93,7 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
 - `mcp.home_assistant`：Home Assistant MCP 配置
 - `music`：音乐服务配置，推荐使用 Navidrome；不需要音乐功能时保持 `music.enabled: false`
 - `runtime` / `capture`：唤醒和录音参数，通常先使用示例值
+- `airplay`：AirPlay 音频输出配置，默认关闭
 
 ### 5. 安装到音箱
 
@@ -139,7 +140,6 @@ Agent 启动后会常驻运行：
 
 ## TODO
 
-- [ ] 支持 AirPlay 音频输出
 - [ ] 支持 Agent 网络搜索
 - [ ] 支持音箱按键控制
 
