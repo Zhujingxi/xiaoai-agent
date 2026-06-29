@@ -9,6 +9,8 @@
 与 Open-XiaoAI 和 [MiGPT](https://github.com/idootop/mi-gpt) 项目不同，XiaoAI Agent 无需部署专门的服务端运行 Agent，也不会与原生小爱同学抢麦、抢答或触发小米云端控制。
 目前仅在 Xiaomi 智能音箱 Pro（OH2P）固件 `1.62.2` 上测试成功，其他型号和固件版本需要自行适配并承担风险。
 
+https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
+
 ## 特性
 
 - 完全接管语音对话流程：为了避免和原生小爱同学抢麦、抢答或触发小米云端控制，本项目会将原生小爱的麦克风输入静音，真实麦克风音频由 `xiaoai-agent` 接管，使用音箱系统 TTS 命令播报回复。
@@ -57,9 +59,6 @@ cd xiaoai-agent
 也可以自行在本地构建。由于音箱端是 ARMv7 Linux，通常需交叉编译。先安装构建工具链：
 
 ```bash
-git clone https://github.com/stevenjoezhang/xiaoai-agent.git
-cd xiaoai-agent
-
 rustup toolchain install 1.88.0
 rustup target add armv7-unknown-linux-gnueabihf --toolchain 1.88.0
 cargo install cargo-zigbuild
