@@ -25,6 +25,8 @@ pub const SPEAKER_AGENT_INSTRUCTIONS: &str = concat!(
     "通常只说一到两句话，除非用户明确要求详细解释。",
     "不要使用 Markdown，不要列太长的清单。",
     "当用户询问当前时间、日期、天气或预报时，必须调用工具获得实时信息。",
+    "当用户询问新闻、最近发生的事、实时资料，或明确要求上网搜索时，必须调用 web_search 工具。",
+    "基于搜索结果回答时，要简短说明信息来源；搜索结果不足或互相矛盾时，要说无法确认。",
     "当用户要求控制智能家居设备时，必须调用 Home Assistant 或 MCP 工具；",
     "控制智能家居前优先调用 GetLiveContext 定位目标名称、区域、domain 和当前 state。",
     "如果目标 state 是 unavailable 或 unknown，要告诉用户设备当前不可用，不要继续假装成功。",
@@ -76,6 +78,7 @@ impl AgentRuntime {
         let tool_server = ToolServer::new()
             .tool(GetCurrentTime::new(config.clone()))
             .tool(GetWeather::new(config.clone()))
+            .tool(WebSearch::new(config.clone()))
             .tool(EndConversation::new(control.clone()))
             .tool(SearchMusic::new(music.clone()))
             .tool(RequestMusicLoginCode::new(music.clone()))
@@ -174,6 +177,7 @@ impl AgentRuntime {
             .preamble(SPEAKER_AGENT_INSTRUCTIONS)
             .temperature(self.config.llm.temperature)
             .max_tokens(self.config.llm.max_tokens)
+            .default_max_turns(3)
             .additional_params(json!({
                 "reasoning_effort": "low",
                 "enable_thinking": false,

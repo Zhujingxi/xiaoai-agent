@@ -231,6 +231,7 @@ impl Default for LlmConfig {
 pub struct AgentConfig {
     pub timezone: String,
     pub weather: WeatherConfig,
+    pub web_search: WebSearchConfig,
 }
 
 impl Default for AgentConfig {
@@ -238,6 +239,7 @@ impl Default for AgentConfig {
         Self {
             timezone: "Asia/Shanghai".to_string(),
             weather: WeatherConfig::default(),
+            web_search: WebSearchConfig::default(),
         }
     }
 }
@@ -258,6 +260,30 @@ impl Default for WeatherConfig {
             default_location: String::new(),
             ip_lookup_url: "https://ipapi.co/json/".to_string(),
             timeout_s: 5.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WebSearchConfig {
+    pub enabled: bool,
+    pub tavily_url: String,
+    pub api_key: String,
+    pub timeout_s: f64,
+    pub max_results: usize,
+    pub search_depth: String,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tavily_url: "https://api.tavily.com/search".to_string(),
+            api_key: String::new(),
+            timeout_s: 10.0,
+            max_results: 3,
+            search_depth: "basic".to_string(),
         }
     }
 }

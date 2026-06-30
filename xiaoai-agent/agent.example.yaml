@@ -57,7 +57,7 @@ llm:
   base_url: https://api.openai.com/v1
   api_key: EMPTY
   model: gpt-5.4-mini
-  timeout_s: 5
+  timeout_s: 35
   max_tokens: 300
   retries: 1
   temperature: 0.5
@@ -69,6 +69,13 @@ agent:
     default_location: ""
     ip_lookup_url: https://ipapi.co/json/
     timeout_s: 5
+  web_search:
+    enabled: false
+    tavily_url: https://api.tavily.com/search
+    api_key: ""
+    timeout_s: 10
+    max_results: 3
+    search_depth: basic
 
 mcp:
   home_assistant:
