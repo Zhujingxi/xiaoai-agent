@@ -40,6 +40,7 @@ const TARGET_SCORE_OFFSET: usize = 380;
 const EFFECT_MODE_OFFSET: usize = 384;
 const CONFIG_PATH_OFFSET: usize = 388;
 const USER_CTX_OFFSET: usize = 392;
+const VPM_USER_CTX_SENTINEL: usize = u32::from_be_bytes(*b"VPMP") as usize;
 const LOG_CALLBACK_OFFSET: usize = 396;
 const EVENT_CALLBACK_OFFSET: usize = 400;
 const WAKEUP_DATA_CALLBACK_OFFSET: usize = 404;
@@ -255,7 +256,7 @@ where
 
         let mut init = vec![0u8; INIT_SIZE];
         write_ptr(&mut init, CONFIG_PATH_OFFSET, config_dir.as_ptr() as usize)?;
-        write_ptr(&mut init, USER_CTX_OFFSET, 0x5650_4d50)?;
+        write_ptr(&mut init, USER_CTX_OFFSET, VPM_USER_CTX_SENTINEL)?;
         write_ptr(
             &mut init,
             LOG_CALLBACK_OFFSET,

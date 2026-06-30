@@ -2521,8 +2521,8 @@ dependencies = [
 
 [[package]]
 name = "shairplay"
-version = "0.6.0"
-source = "git+https://github.com/stevenjoezhang/shairplay-rust.git?rev=86452c39f6d72b4c44a7a26d025d97ea3da0b3d6#86452c39f6d72b4c44a7a26d025d97ea3da0b3d6"
+version = "0.6.1"
+source = "git+https://github.com/stevenjoezhang/shairplay-rust.git?rev=691f851a4b308f7c276f0b0a891c3b19e04a61bc#691f851a4b308f7c276f0b0a891c3b19e04a61bc"
 dependencies = [
  "aes",
  "astro-dnssd",
