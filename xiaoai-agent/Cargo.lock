@@ -2199,7 +2199,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2465,8 +2465,9 @@ dependencies = [
 
 [[package]]
 name = "shairplay"
-version = "0.6.1"
-source = "git+https://github.com/stevenjoezhang/shairplay-rust.git?rev=691f851a4b308f7c276f0b0a891c3b19e04a61bc#691f851a4b308f7c276f0b0a891c3b19e04a61bc"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c792c7751a561e8df0d0fb7d5da96f0345e15a392b11e7f5485587f54cf99d23"
 dependencies = [
  "aes",
  "astro-dnssd",
