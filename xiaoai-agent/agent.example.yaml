@@ -65,8 +65,8 @@ asr:
     miio_dir: /data/miio
     engine_mode: 2
     connect_wait_ms: 1500
+    # Chunk size only. Buffered audio is always sent as fast as possible.
     chunk_ms: 100
-    throttle: true
     wait_after_finish_ms: 15000
     # Keep true for ASR-only behavior. This sends Execution.RequestControl
     # as a singular "context" on SpeechRecognizer.Recognize and disables

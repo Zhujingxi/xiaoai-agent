@@ -286,9 +286,6 @@ fn transcribe_xiaomi_aivs_blocking(
             if rc == 0 {
                 anyhow::bail!("AIVS postData returned 0");
             }
-            if settings.throttle {
-                thread::sleep(Duration::from_millis(settings.chunk_ms));
-            }
         }
 
         let finish_json = finish_event_json(&dialog_id);
