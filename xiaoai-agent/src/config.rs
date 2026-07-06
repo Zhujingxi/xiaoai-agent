@@ -202,7 +202,7 @@ pub enum AsrProvider {
     #[default]
     #[serde(alias = "openai")]
     OpenAi,
-    #[serde(alias = "open_ai_realtime")]
+    #[serde(alias = "openai_realtime", alias = "open_ai_realtime")]
     OpenAiRealtime,
     XiaomiAivs,
 }
@@ -593,5 +593,16 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
 fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
     if let Some(value) = path {
         *value = resolve_path(root, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AsrConfig, AsrProvider};
+
+    #[test]
+    fn parses_openai_realtime_provider_alias() {
+        let config: AsrConfig = serde_yaml::from_str("provider: openai_realtime\n").unwrap();
+        assert!(matches!(config.provider, AsrProvider::OpenAiRealtime));
     }
 }
