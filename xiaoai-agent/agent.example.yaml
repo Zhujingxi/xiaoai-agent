@@ -45,7 +45,7 @@ capture:
   cooldown_s: 0.7
 
 asr:
-  # open_ai or xiaomi_aivs
+  # open_ai, openai_realtime, or xiaomi_aivs
   provider: xiaomi_aivs
 
   # OpenAI-compatible ASR settings. Used when provider is open_ai.
@@ -56,6 +56,16 @@ asr:
     language: zh
     prompt: ""
     timeout_s: 5
+    retries: 1
+
+  # OpenAI Realtime transcription WebSocket settings. Used when provider is openai_realtime.
+  openai_realtime:
+    base_url: https://api.openai.com/v1
+    api_key: EMPTY
+    model: gpt-realtime-whisper
+    target_sample_rate: 24000
+    chunk_ms: 200
+    timeout_s: 10
     retries: 1
 
   # Xiaomi native AIVS ASR. Used when provider is xiaomi_aivs.
