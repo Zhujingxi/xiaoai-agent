@@ -34,6 +34,8 @@ impl AppConfig {
         config.resolve_paths();
         config.llm.base_url = openai_base_url(&config.llm.base_url);
         config.asr.open_ai.base_url = openai_base_url(&config.asr.open_ai.base_url);
+        config.asr.openai_realtime.base_url =
+            openai_realtime_base_url(&config.asr.openai_realtime.base_url);
         Ok(config)
     }
 
@@ -179,6 +181,7 @@ impl Default for CaptureConfig {
 pub struct AsrConfig {
     pub provider: AsrProvider,
     pub open_ai: OpenAiAsrConfig,
+    pub openai_realtime: OpenAiRealtimeAsrConfig,
     pub xiaomi_aivs: XiaomiAivsAsrConfig,
 }
 
@@ -187,6 +190,7 @@ impl Default for AsrConfig {
         Self {
             provider: AsrProvider::XiaomiAivs,
             open_ai: OpenAiAsrConfig::default(),
+            openai_realtime: OpenAiRealtimeAsrConfig::default(),
             xiaomi_aivs: XiaomiAivsAsrConfig::default(),
         }
     }
@@ -198,6 +202,8 @@ pub enum AsrProvider {
     #[default]
     #[serde(alias = "openai")]
     OpenAi,
+    #[serde(alias = "open_ai_realtime")]
+    OpenAiRealtime,
     XiaomiAivs,
 }
 
@@ -222,6 +228,32 @@ impl Default for OpenAiAsrConfig {
             language: "zh".to_string(),
             prompt: String::new(),
             timeout_s: 5.0,
+            retries: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct OpenAiRealtimeAsrConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub target_sample_rate: u32,
+    pub chunk_ms: u32,
+    pub timeout_s: f64,
+    pub retries: u32,
+}
+
+impl Default for OpenAiRealtimeAsrConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "EMPTY".to_string(),
+            model: "gpt-realtime-whisper".to_string(),
+            target_sample_rate: 24_000,
+            chunk_ms: 200,
+            timeout_s: 10.0,
             retries: 1,
         }
     }
@@ -526,6 +558,15 @@ impl Default for NavidromeConfig {
 pub fn openai_base_url(raw: &str) -> String {
     let base = raw.trim_end_matches('/');
     if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    }
+}
+
+pub fn openai_realtime_base_url(raw: &str) -> String {
+    let base = raw.trim_end_matches('/');
+    if base.ends_with("/v1") || base.ends_with("/realtime") {
         base.to_string()
     } else {
         format!("{base}/v1")

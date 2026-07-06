@@ -88,11 +88,17 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
 
 然后编辑 `xiaoai-agent/agent.yaml`：
 
-- `asr.provider`：ASR 后端，可选 `open_ai` 或 `xiaomi_aivs`。`open_ai` 使用
-  OpenAI-compatible ASR 配置；`xiaomi_aivs` 复用音箱原生 AIVS ASR，并默认发送
-  ASR-only `Execution.RequestControl`，避免云端 NLP/TTS/设备控制副作用。
+- `asr.provider`：ASR 后端，可选 `open_ai`、`openai_realtime` 或
+  `xiaomi_aivs`。`open_ai` 使用 OpenAI-compatible HTTP ASR 配置；
+  `openai_realtime` 使用 OpenAI Realtime transcription WebSocket 事件协议；
+  `xiaomi_aivs` 复用音箱原生 AIVS ASR，并默认发送 ASR-only
+  `Execution.RequestControl`，避免云端 NLP/TTS/设备控制副作用。
 - `asr.open_ai.base_url`、`asr.open_ai.api_key`、`asr.open_ai.model`：
   OpenAI-compatible ASR 服务配置
+- `asr.openai_realtime.base_url`、`asr.openai_realtime.api_key`、
+  `asr.openai_realtime.model`：OpenAI Realtime transcription 服务配置；选择
+  `openai_realtime` 时，录音链路会在 VAD 采集期间持续发送
+  `input_audio_buffer.append`，并在一句话结束后 `commit` 等待最终文本
 - `llm.base_url`、`llm.api_key`、`llm.model`：大模型服务配置
 - `mcp.home_assistant`：Home Assistant MCP 配置
 - `music`：音乐服务配置，推荐使用 Navidrome；不需要音乐功能时保持 `music.enabled: false`
@@ -138,7 +144,8 @@ Agent 启动后会常驻运行：
 1. 使用固件原生 VPM/FlexKWS 监听唤醒词。
 2. 每次唤醒都会中断当前语音输出或音乐播放，并重置当前对话轮次。
 3. 从 VPM ASR 回调流采集一段 16 kHz 单声道音频。
-4. 使用配置的 ASR 后端识别文本，可选 OpenAI-compatible ASR 或原生 Xiaomi AIVS ASR。
+4. 使用配置的 ASR 后端识别文本，可选 OpenAI-compatible HTTP ASR、OpenAI
+   Realtime transcription 或原生 Xiaomi AIVS ASR。
 5. 把识别文本交给端侧 Rig Agent，并按需调用 MCP、天气、音乐等工具。
 6. 使用小爱音箱系统 TTS 命令朗读回复。
 

@@ -11,22 +11,33 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use base64::Engine;
+use futures::{SinkExt, StreamExt};
 use libloading::Library;
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::time::timeout;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
+use url::Url;
 
 use crate::config::{
-    timeout_duration, AsrConfig, AsrProvider, OpenAiAsrConfig, XiaomiAivsAsrConfig,
+    timeout_duration, AsrConfig, AsrProvider, OpenAiAsrConfig, OpenAiRealtimeAsrConfig,
+    XiaomiAivsAsrConfig,
 };
 use crate::vad::BYTES_PER_SAMPLE;
 
 #[derive(Clone)]
 pub enum AsrClient {
     OpenAi(OpenAiAsr),
+    OpenAiRealtime(OpenAiRealtimeAsr),
     XiaomiAivs(XiaomiAivsAsr),
 }
 
@@ -34,6 +45,9 @@ impl AsrClient {
     pub fn new(config: AsrConfig) -> anyhow::Result<Self> {
         Ok(match config.provider {
             AsrProvider::OpenAi => Self::OpenAi(OpenAiAsr::new(config.open_ai)),
+            AsrProvider::OpenAiRealtime => {
+                Self::OpenAiRealtime(OpenAiRealtimeAsr::new(config.openai_realtime))
+            }
             AsrProvider::XiaomiAivs => Self::XiaomiAivs(XiaomiAivsAsr::new(config)),
         })
     }
@@ -41,7 +55,18 @@ impl AsrClient {
     pub async fn transcribe_pcm(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {
         match self {
             Self::OpenAi(asr) => asr.transcribe_pcm(pcm, sample_rate).await,
+            Self::OpenAiRealtime(asr) => asr.transcribe_pcm(pcm, sample_rate).await,
             Self::XiaomiAivs(asr) => asr.transcribe_pcm(pcm, sample_rate).await,
+        }
+    }
+
+    pub async fn start_streaming_transcription(
+        &self,
+        sample_rate: u32,
+    ) -> anyhow::Result<Option<RealtimeAsrSession>> {
+        match self {
+            Self::OpenAiRealtime(asr) => Ok(Some(asr.start_streaming_session(sample_rate).await?)),
+            _ => Ok(None),
         }
     }
 }
@@ -119,6 +144,426 @@ impl OpenAiAsr {
 #[derive(Debug, Deserialize)]
 struct TranscriptionResponse {
     text: String,
+}
+
+#[derive(Clone)]
+pub struct OpenAiRealtimeAsr {
+    config: OpenAiRealtimeAsrConfig,
+}
+
+impl OpenAiRealtimeAsr {
+    pub fn new(config: OpenAiRealtimeAsrConfig) -> Self {
+        Self { config }
+    }
+
+    pub async fn transcribe_pcm(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {
+        let attempts = self.config.retries.saturating_add(1);
+        let mut last_error = None;
+
+        for attempt in 1..=attempts {
+            match self.transcribe_pcm_once(pcm, sample_rate).await {
+                Ok(text) => return Ok(text),
+                Err(err) => {
+                    if attempt < attempts {
+                        warn!("Realtime ASR attempt {attempt}/{attempts} failed: {err:?}");
+                    }
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Realtime ASR failed without attempts")))
+    }
+
+    async fn transcribe_pcm_once(&self, pcm: &[u8], sample_rate: u32) -> anyhow::Result<String> {
+        timeout(
+            timeout_duration(self.config.timeout_s),
+            self.transcribe_pcm_once_inner(pcm, sample_rate),
+        )
+        .await
+        .context("Realtime ASR request timed out")?
+    }
+
+    async fn transcribe_pcm_once_inner(
+        &self,
+        pcm: &[u8],
+        sample_rate: u32,
+    ) -> anyhow::Result<String> {
+        let session = self.start_streaming_session(sample_rate).await?;
+        let appender = session.appender();
+        appender.append_pcm(pcm.to_vec()).await?;
+        session.commit_and_transcribe().await
+    }
+
+    pub async fn start_streaming_session(
+        &self,
+        sample_rate: u32,
+    ) -> anyhow::Result<RealtimeAsrSession> {
+        timeout(
+            timeout_duration(self.config.timeout_s),
+            self.start_streaming_session_inner(sample_rate),
+        )
+        .await
+        .context("Realtime ASR connection timed out")?
+    }
+
+    async fn start_streaming_session_inner(
+        &self,
+        sample_rate: u32,
+    ) -> anyhow::Result<RealtimeAsrSession> {
+        let url = realtime_ws_url(&self.config.base_url, &self.config.model)?;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .with_context(|| format!("invalid Realtime ASR websocket URL: {url}"))?;
+
+        request.headers_mut().insert(
+            HeaderName::from_static("openai-beta"),
+            HeaderValue::from_static("realtime=v1"),
+        );
+        if !self.config.api_key.trim().is_empty() && self.config.api_key != "EMPTY" {
+            let value = HeaderValue::from_str(&format!("Bearer {}", self.config.api_key))
+                .context("invalid Realtime ASR API key header")?;
+            request.headers_mut().insert(AUTHORIZATION, value);
+        }
+
+        let (mut ws, _response) = connect_async(request)
+            .await
+            .with_context(|| format!("connect Realtime ASR websocket {url}"))?;
+
+        send_realtime_event(
+            &mut ws,
+            json!({
+                "type": "session.update",
+                "session": {
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "format": "pcm16",
+                            "turn_detection": null,
+                            "transcription": {
+                                "model": self.config.model,
+                            },
+                        },
+                    },
+                },
+            }),
+        )
+        .await?;
+
+        let (tx, rx) = tokio_mpsc::channel(256);
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(run_realtime_stream(ws, rx, result_tx));
+
+        Ok(RealtimeAsrSession {
+            tx,
+            result_rx,
+            sample_rate,
+            target_sample_rate: self.config.target_sample_rate,
+            timeout_s: self.config.timeout_s,
+        })
+    }
+}
+
+pub struct RealtimeAsrSession {
+    tx: tokio_mpsc::Sender<RealtimeStreamCommand>,
+    result_rx: oneshot::Receiver<anyhow::Result<String>>,
+    sample_rate: u32,
+    target_sample_rate: u32,
+    timeout_s: f64,
+}
+
+impl RealtimeAsrSession {
+    pub fn appender(&self) -> RealtimeAsrAppender {
+        RealtimeAsrAppender {
+            tx: self.tx.clone(),
+            sample_rate: self.sample_rate,
+            target_sample_rate: self.target_sample_rate,
+        }
+    }
+
+    pub async fn commit_and_transcribe(self) -> anyhow::Result<String> {
+        self.tx
+            .send(RealtimeStreamCommand::Commit)
+            .await
+            .context("commit Realtime ASR audio buffer")?;
+        timeout(timeout_duration(self.timeout_s), self.result_rx)
+            .await
+            .context("timed out waiting for Realtime ASR transcript")?
+            .context("Realtime ASR stream ended before transcript")?
+    }
+
+    pub async fn close(self) {
+        let _ = self.tx.send(RealtimeStreamCommand::Close).await;
+    }
+}
+
+#[derive(Clone)]
+pub struct RealtimeAsrAppender {
+    tx: tokio_mpsc::Sender<RealtimeStreamCommand>,
+    sample_rate: u32,
+    target_sample_rate: u32,
+}
+
+impl RealtimeAsrAppender {
+    pub async fn append_pcm(&self, pcm: Vec<u8>) -> anyhow::Result<()> {
+        let audio = resample_pcm16_mono_linear(&pcm, self.sample_rate, self.target_sample_rate)?;
+        if audio.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(RealtimeStreamCommand::Append(audio))
+            .await
+            .context("append Realtime ASR audio")
+    }
+
+    pub async fn clear(&self) -> anyhow::Result<()> {
+        self.tx
+            .send(RealtimeStreamCommand::Clear)
+            .await
+            .context("clear Realtime ASR audio buffer")
+    }
+}
+
+enum RealtimeStreamCommand {
+    Append(Vec<u8>),
+    Clear,
+    Commit,
+    Close,
+}
+
+async fn run_realtime_stream<S>(
+    mut ws: S,
+    mut rx: tokio_mpsc::Receiver<RealtimeStreamCommand>,
+    result_tx: oneshot::Sender<anyhow::Result<String>>,
+) where
+    S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let mut result_tx = Some(result_tx);
+    let mut last_delta = String::new();
+
+    loop {
+        tokio::select! {
+            command = rx.recv() => {
+                let Some(command) = command else {
+                    let _ = ws.close().await;
+                    break;
+                };
+                let result = match command {
+                    RealtimeStreamCommand::Append(audio) => {
+                        send_realtime_event(
+                            &mut ws,
+                            json!({
+                                "type": "input_audio_buffer.append",
+                                "audio": base64::engine::general_purpose::STANDARD.encode(audio),
+                            }),
+                        ).await
+                    }
+                    RealtimeStreamCommand::Clear => {
+                        last_delta.clear();
+                        send_realtime_event(&mut ws, json!({ "type": "input_audio_buffer.clear" })).await
+                    }
+                    RealtimeStreamCommand::Commit => {
+                        send_realtime_event(&mut ws, json!({ "type": "input_audio_buffer.commit" })).await
+                    }
+                    RealtimeStreamCommand::Close => {
+                        let _ = ws.close().await;
+                        break;
+                    }
+                };
+                if let Err(err) = result {
+                    send_realtime_result(&mut result_tx, Err(err));
+                    break;
+                }
+            }
+            message = ws.next() => {
+                let Some(message) = message else {
+                    if !last_delta.trim().is_empty() {
+                        send_realtime_result(&mut result_tx, Ok(last_delta.trim().to_string()));
+                    } else {
+                        send_realtime_result(
+                            &mut result_tx,
+                            Err(anyhow::anyhow!("Realtime ASR websocket ended before transcript completed")),
+                        );
+                    }
+                    break;
+                };
+                let message = match message {
+                    Ok(message) => message,
+                    Err(err) => {
+                        send_realtime_result(
+                            &mut result_tx,
+                            Err(anyhow::anyhow!("read Realtime ASR websocket message: {err}")),
+                        );
+                        break;
+                    }
+                };
+                let Message::Text(text) = message else {
+                    if message.is_close() {
+                        send_realtime_result(
+                            &mut result_tx,
+                            Err(anyhow::anyhow!("Realtime ASR websocket closed before transcript completed")),
+                        );
+                        break;
+                    }
+                    continue;
+                };
+                let event: Value = match serde_json::from_str(&text) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        send_realtime_result(
+                            &mut result_tx,
+                            Err(anyhow::anyhow!("invalid Realtime ASR event JSON: {err}: {text}")),
+                        );
+                        break;
+                    }
+                };
+                match event.get("type").and_then(Value::as_str) {
+                    Some("conversation.item.input_audio_transcription.completed") => {
+                        let text = event
+                            .get("transcript")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        send_realtime_result(&mut result_tx, Ok(text));
+                        let _ = ws.close().await;
+                        break;
+                    }
+                    Some("conversation.item.input_audio_transcription.delta") => {
+                        if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                            last_delta.push_str(delta);
+                        }
+                    }
+                    Some("error") => {
+                        send_realtime_result(
+                            &mut result_tx,
+                            Err(anyhow::anyhow!("Realtime ASR error: {}", realtime_error_message(&event))),
+                        );
+                        break;
+                    }
+                    Some("conversation.item.input_audio_transcription.failed") => {
+                        send_realtime_result(
+                            &mut result_tx,
+                            Err(anyhow::anyhow!("Realtime ASR transcription failed: {}", realtime_error_message(&event))),
+                        );
+                        break;
+                    }
+                    Some(other) => {
+                        debug!(event_type = other, "Realtime ASR event");
+                    }
+                    None => {
+                        debug!(event = %event, "Realtime ASR event without type");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn send_realtime_result(
+    result_tx: &mut Option<oneshot::Sender<anyhow::Result<String>>>,
+    result: anyhow::Result<String>,
+) {
+    if let Some(tx) = result_tx.take() {
+        let _ = tx.send(result);
+    }
+}
+
+async fn send_realtime_event<S>(ws: &mut S, event: Value) -> anyhow::Result<()>
+where
+    S: futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    ws.send(Message::Text(event.to_string().into()))
+        .await
+        .context("send Realtime ASR websocket event")
+}
+
+fn realtime_error_message(event: &Value) -> String {
+    if let Some(message) = event.get("error").and_then(|error| {
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| error.get("code").and_then(Value::as_str))
+    }) {
+        message.to_string()
+    } else {
+        event.to_string()
+    }
+}
+
+fn realtime_ws_url(base_url: &str, model: &str) -> anyhow::Result<String> {
+    let mut url = Url::parse(base_url.trim_end_matches('/'))
+        .with_context(|| format!("invalid Realtime ASR base_url: {base_url}"))?;
+    let scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        "ws" => "ws",
+        "wss" => "wss",
+        other => anyhow::bail!("unsupported Realtime ASR URL scheme: {other}"),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| anyhow::anyhow!("unsupported Realtime ASR URL scheme: {scheme}"))?;
+
+    let path = url.path().trim_end_matches('/');
+    let realtime_path = if path.is_empty() || path == "/" {
+        "/v1/realtime".to_string()
+    } else if path.ends_with("/realtime") {
+        path.to_string()
+    } else if path.ends_with("/v1") {
+        format!("{path}/realtime")
+    } else {
+        format!("{path}/v1/realtime")
+    };
+    url.set_path(&realtime_path);
+    url.query_pairs_mut().clear().append_pair("model", model);
+    Ok(url.to_string())
+}
+
+fn resample_pcm16_mono_linear(
+    pcm: &[u8],
+    sample_rate: u32,
+    target_sample_rate: u32,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        pcm.len() % BYTES_PER_SAMPLE == 0,
+        "PCM16 byte length is odd"
+    );
+    anyhow::ensure!(sample_rate > 0, "sample_rate must be positive");
+    anyhow::ensure!(
+        target_sample_rate > 0,
+        "target_sample_rate must be positive"
+    );
+    if sample_rate == target_sample_rate {
+        return Ok(pcm.to_vec());
+    }
+
+    let samples: Vec<i16> = pcm
+        .chunks_exact(BYTES_PER_SAMPLE)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let output_len =
+        (samples.len() as u64 * target_sample_rate as u64).div_ceil(sample_rate as u64) as usize;
+    let ratio = sample_rate as f64 / target_sample_rate as f64;
+    let mut out = Vec::with_capacity(output_len * BYTES_PER_SAMPLE);
+    for i in 0..output_len {
+        let src = i as f64 * ratio;
+        let idx = src.floor() as usize;
+        let frac = src - idx as f64;
+        let a = samples[idx.min(samples.len() - 1)] as f64;
+        let b = samples[(idx + 1).min(samples.len() - 1)] as f64;
+        let value = (a + (b - a) * frac)
+            .round()
+            .clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(out)
 }
 
 fn wav_bytes(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
@@ -1169,7 +1614,7 @@ fn finish_event_json(dialog_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::GnuString32;
+    use super::{realtime_ws_url, resample_pcm16_mono_linear, GnuString32};
 
     #[test]
     fn gnu_string32_has_expected_size() {
@@ -1178,5 +1623,24 @@ mod tests {
         } else {
             assert_eq!(std::mem::size_of::<GnuString32>(), 32);
         }
+    }
+
+    #[test]
+    fn realtime_ws_url_normalizes_http_base() {
+        let url = realtime_ws_url("http://100.83.50.55:4400/v1", "gpt-realtime-whisper").unwrap();
+        assert_eq!(
+            url,
+            "ws://100.83.50.55:4400/v1/realtime?model=gpt-realtime-whisper"
+        );
+    }
+
+    #[test]
+    fn realtime_resampler_upsamples_16k_to_24k() {
+        let pcm = [0i16, 16_000, -16_000, 0]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let resampled = resample_pcm16_mono_linear(&pcm, 16_000, 24_000).unwrap();
+        assert_eq!(resampled.len(), 6 * 2);
     }
 }
