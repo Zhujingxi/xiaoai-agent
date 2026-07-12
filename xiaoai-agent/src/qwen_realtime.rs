@@ -10,6 +10,7 @@ macro_rules! string_newtype {
         pub struct $name(pub String);
 
         impl $name {
+            #[allow(dead_code)]
             pub fn new(value: impl Into<String>) -> Self {
                 Self(value.into())
             }
@@ -50,6 +51,11 @@ pub enum ClientEvent {
     },
     #[serde(rename = "input_audio_buffer.commit")]
     InputAudioBufferCommit {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        event_id: Option<EventId>,
+    },
+    #[serde(rename = "input_audio_buffer.clear")]
+    InputAudioBufferClear {
         #[serde(skip_serializing_if = "Option::is_none")]
         event_id: Option<EventId>,
     },

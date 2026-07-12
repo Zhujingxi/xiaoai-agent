@@ -10,8 +10,8 @@ mod mcp;
 mod mcp_legacy_sse;
 mod monitor;
 mod music;
-#[allow(dead_code)] // Typed protocol for the opt-in runtime added in a later commit.
 mod qwen_realtime;
+mod qwen_voice;
 mod shell;
 mod tools;
 mod vad;
@@ -35,10 +35,11 @@ use crate::airplay::AirPlayService;
 use crate::asr::AsrClient;
 use crate::audio::record::AudioRecorder;
 use crate::capture::{record_utterance, record_utterance_streaming};
-use crate::config::{AppConfig, DeviceConfig};
+use crate::config::{AppConfig, DeviceConfig, VoiceRuntime};
 use crate::device::Device;
 use crate::monitor::kws::{KwsMonitor, KwsMonitorEvent};
 use crate::music::MusicService;
+use crate::qwen_voice::QwenVoiceService;
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
 const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，请稍后重试";
@@ -68,6 +69,8 @@ async fn main() -> anyhow::Result<()> {
     let music = Arc::new(MusicService::new(config.clone(), device.clone())?);
     let airplay = AirPlayService::start(config.airplay.clone()).await?;
     let agent = Arc::new(AgentRuntime::new(config.clone(), device.clone(), music.clone()).await?);
+    let qwen_voice = (config.voice.runtime == VoiceRuntime::NativeQwen)
+        .then(|| QwenVoiceService::new(config.voice.qwen.clone(), config.capture.clone()));
 
     let (kws_tx, mut kws_rx) = mpsc::channel::<KwsMonitorEvent>(16);
     let mut kws = KwsMonitor::new();
@@ -89,6 +92,9 @@ async fn main() -> anyhow::Result<()> {
                     KwsMonitorEvent::Started => info!("KWS monitor started"),
                     KwsMonitorEvent::Keyword(keyword) => {
                         info!("WAKE keyword={keyword}");
+                        if let Some(qwen) = &qwen_voice {
+                            qwen.cancel_active().await;
+                        }
                         if let Some(handle) = active_turn.take() {
                             if !handle.is_finished() {
                                 handle.abort();
@@ -105,19 +111,33 @@ async fn main() -> anyhow::Result<()> {
                         cleanup_turn_leds(&device, &config.device).await;
                         agent.reset_session("wake keyword").await;
 
-                        let state = TurnState {
-                            config: config.clone(),
-                            device: device.clone(),
-                            asr: asr.clone(),
-                            agent: agent.clone(),
-                            music: music.clone(),
-                            airplay: airplay.clone(),
+                        active_turn = if let Some(qwen) = qwen_voice.clone() {
+                            let device = device.clone();
+                            let device_config = config.device.clone();
+                            let idle_timeout = Duration::from_secs_f64(
+                                config.runtime.session_idle_timeout_s.max(1.0),
+                            );
+                            Some(tokio::spawn(async move {
+                                if let Err(err) = qwen.run_session(idle_timeout).await {
+                                    error!("native Qwen voice session failed: {err:?}");
+                                }
+                                cleanup_turn_leds(&device, &device_config).await;
+                            }))
+                        } else {
+                            let state = TurnState {
+                                config: config.clone(),
+                                device: device.clone(),
+                                asr: asr.clone(),
+                                agent: agent.clone(),
+                                music: music.clone(),
+                                airplay: airplay.clone(),
+                            };
+                            Some(tokio::spawn(async move {
+                                if let Err(err) = run_turn(state).await {
+                                    error!("turn failed: {err:?}");
+                                }
+                            }))
                         };
-                        active_turn = Some(tokio::spawn(async move {
-                            if let Err(err) = run_turn(state).await {
-                                error!("turn failed: {err:?}");
-                            }
-                        }));
                     }
                 }
             }
