@@ -396,23 +396,47 @@ fn is_vpm_asr_capture(pcm: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
     use super::*;
 
     static LAST_STATUS: AtomicI32 = AtomicI32::new(0);
+    static END_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     fn record_status(status: i32) -> bool {
         LAST_STATUS.store(status, Ordering::SeqCst);
+        if status == VPM_STATUS_ASR_END {
+            END_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
         true
     }
 
-    #[test]
-    fn vpm_asr_guard_sends_end_when_dropped() {
+    #[tokio::test]
+    async fn real_vpm_stream_abort_sends_asr_end_once_before_join_completes() {
         LAST_STATUS.store(0, Ordering::SeqCst);
-        drop(VpmAsrGuard {
-            set_status: record_status,
+        END_COUNT.store(0, Ordering::SeqCst);
+        let (_audio_tx, audio_rx) = broadcast::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = VpmAsrGuard {
+                set_status: record_status,
+            };
+            started_tx.send(()).unwrap();
+            collect_vpm_asr_utterance_streaming(
+                CaptureConfig::default(),
+                Duration::from_secs(30),
+                || async {},
+                |_bytes| async { Ok(()) },
+                || async { Ok(()) },
+                audio_rx,
+            )
+            .await
         });
+
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(LAST_STATUS.load(Ordering::SeqCst), VPM_STATUS_ASR_END);
+        assert_eq!(END_COUNT.load(Ordering::SeqCst), 1);
     }
 }
