@@ -1,0 +1,29 @@
+{
+  "event_id": "event_CSaxRRYLvbrfexDXAEuDG",
+  "type": "response.done",
+  "response": {
+    "id": "resp_HaVOPdbmX6vifiV5pAfJY",
+    "object": "realtime.response",
+    "conversation_id": "conv_FjJaccpnvwHNo9cPVuzGc",
+    "status": "completed",
+    "modalities": ["text", "audio"],
+    "voice": "Cherry",
+    "output_audio_format": "pcm",
+    "output": [{
+      "id": "item_Ls6MtCUWO7LM4E59QziNv",
+      "object": "realtime.item",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "content": [{"type": "audio", "transcript": "你好呀！有什么我可以帮你的吗？"}]
+    }],
+    "usage": {
+      "total_tokens": 377,
+      "input_tokens": 336,
+      "output_tokens": 41,
+      "input_tokens_details": {"text_tokens": 228, "audio_tokens": 108},
+      "output_tokens_details": {"text_tokens": 9, "audio_tokens": 32},
+      "plugins": {"search": {"count": 1, "strategy": "agent"}}
+    }
+  }
+}

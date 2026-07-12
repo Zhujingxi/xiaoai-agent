@@ -1,0 +1,42 @@
+{
+  "event_id": "event_ToPZqeobitzUJnt3QqtWg",
+  "type": "session.update",
+  "session": {
+    "modalities": ["text", "audio"],
+    "voice": "Chelsie",
+    "input_audio_format": "pcm",
+    "output_audio_format": "pcm",
+    "instructions": "你是某五星级酒店的AI客服专员，请准确且友好地解答客户关于房型、设施、价格、预订政策的咨询。请始终以专业和乐于助人的态度回应，杜绝提供未经证实或超出酒店服务范围的信息。",
+    "turn_detection": {
+      "type": "server_vad",
+      "threshold": 0.5,
+      "silence_duration_ms": 800
+    },
+    "enable_search": true,
+    "search_options": {"enable_source": true},
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_current_weather",
+        "description": "当你想查询指定城市的天气时非常有用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "城市或县区，比如北京市、杭州市、余杭区等。"
+            }
+          },
+          "required": ["location"]
+        }
+      }
+    }],
+    "seed": 1314,
+    "max_tokens": 16384,
+    "repetition_penalty": 1.05,
+    "presence_penalty": 0.0,
+    "top_k": 50,
+    "top_p": 1.0,
+    "temperature": 0.9
+  }
+}

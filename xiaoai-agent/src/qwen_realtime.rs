@@ -1,6 +1,7 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 macro_rules! string_newtype {
     ($name:ident) => {
@@ -28,11 +29,11 @@ pub struct SampleRate(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AudioFormat {
-    #[serde(rename = "pcm16")]
-    Pcm16,
+    #[serde(rename = "pcm")]
+    Pcm,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientEvent {
     #[serde(rename = "session.update")]
@@ -80,10 +81,55 @@ pub struct SessionUpdate {
     pub voice: String,
     pub input_audio_format: AudioFormat,
     pub output_audio_format: AudioFormat,
-    pub input_audio_sample_rate: SampleRate,
-    pub output_audio_sample_rate: SampleRate,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolDefinition {
+    Function { function: FunctionDefinition },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: FunctionParameters,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionParameters {
+    #[serde(rename = "type")]
+    pub schema_type: ObjectSchemaType,
+    pub properties: BTreeMap<String, FunctionProperty>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectSchemaType {
+    #[serde(rename = "object")]
+    Object,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionProperty {
+    #[serde(rename = "type")]
+    pub schema_type: PropertySchemaType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PropertySchemaType {
+    String,
+    Number,
+    Integer,
+    Boolean,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +162,7 @@ pub struct FunctionCallOutput(pub String);
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerEvent {
     SessionUpdated(SessionUpdatedEvent),
+    ResponseDone(ResponseDoneEvent),
     ResponseAudioDelta(ResponseAudioDeltaEvent),
     ResponseAudioDone(ResponseAudioDoneEvent),
     ResponseAudioTranscriptDelta(ResponseAudioTranscriptDeltaEvent),
@@ -146,6 +193,7 @@ impl<'de> Deserialize<'de> for ServerEvent {
 
         match event_type {
             "session.updated" => decode!(SessionUpdated, SessionUpdatedEvent),
+            "response.done" => decode!(ResponseDone, ResponseDoneEvent),
             "response.audio.delta" => decode!(ResponseAudioDelta, ResponseAudioDeltaEvent),
             "response.audio.done" => decode!(ResponseAudioDone, ResponseAudioDoneEvent),
             "response.audio_transcript.delta" => decode!(
@@ -174,7 +222,97 @@ impl<'de> Deserialize<'de> for ServerEvent {
 pub struct SessionUpdatedEvent {
     #[serde(default)]
     pub event_id: Option<EventId>,
-    pub session: SessionUpdate,
+    pub session: SessionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SessionState {
+    pub id: String,
+    pub object: String,
+    pub model: String,
+    pub modalities: Vec<Modality>,
+    pub voice: String,
+    pub input_audio_format: AudioFormat,
+    pub output_audio_format: AudioFormat,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<ToolDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ResponseDoneEvent {
+    #[serde(default)]
+    pub event_id: Option<EventId>,
+    pub response: RealtimeResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RealtimeResponse {
+    pub id: ResponseId,
+    pub object: String,
+    pub conversation_id: String,
+    pub status: ResponseStatus,
+    pub modalities: Vec<Modality>,
+    pub voice: String,
+    pub output_audio_format: AudioFormat,
+    #[serde(default)]
+    pub output: Vec<ResponseOutputItem>,
+    #[serde(default)]
+    pub usage: Option<ResponseUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseStatus {
+    Completed,
+    #[serde(alias = "cancelled")]
+    Canceled,
+    Failed,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseOutputItem {
+    Message {
+        id: ItemId,
+        status: ResponseStatus,
+        role: String,
+        #[serde(default)]
+        content: Vec<ResponseContent>,
+    },
+    FunctionCall {
+        id: ItemId,
+        status: ResponseStatus,
+        call_id: CallId,
+        name: String,
+        arguments: FunctionArguments,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseContent {
+    Audio { transcript: String },
+    Text { text: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ResponseUsage {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub input_tokens_details: TokenDetails,
+    pub output_tokens_details: TokenDetails,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TokenDetails {
+    #[serde(default)]
+    pub text_tokens: u64,
+    #[serde(default)]
+    pub audio_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -260,6 +398,67 @@ pub struct RealtimeError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Verbatim JSON examples from Alibaba Cloud's official Qwen-Omni-Realtime docs:
+    // https://help.aliyun.com/zh/model-studio/client-events.md
+    const OFFICIAL_CLIENT_SESSION_UPDATE: &str =
+        include_str!("../tests/fixtures/qwen_client_session_update.json");
+    // https://help.aliyun.com/zh/model-studio/server-events.md
+    const OFFICIAL_SERVER_SESSION_UPDATED: &str =
+        include_str!("../tests/fixtures/qwen_server_session_updated.json");
+    const OFFICIAL_SERVER_RESPONSE_DONE: &str =
+        include_str!("../tests/fixtures/qwen_server_response_done.json");
+
+    #[test]
+    fn parses_official_client_session_update_fixture() {
+        let event: ClientEvent = serde_json::from_str(OFFICIAL_CLIENT_SESSION_UPDATE).unwrap();
+        let ClientEvent::SessionUpdate { session, .. } = event else {
+            panic!("expected session.update");
+        };
+
+        assert_eq!(session.input_audio_format, AudioFormat::Pcm);
+        assert_eq!(session.output_audio_format, AudioFormat::Pcm);
+        let ToolDefinition::Function { function } = &session.tools[0];
+        assert_eq!(function.name, "get_current_weather");
+        assert_eq!(
+            serde_json::to_value(AudioFormat::Pcm).unwrap(),
+            json!("pcm")
+        );
+    }
+
+    #[test]
+    fn parses_official_server_session_updated_fixture() {
+        let event: ServerEvent = serde_json::from_str(OFFICIAL_SERVER_SESSION_UPDATED).unwrap();
+        let ServerEvent::SessionUpdated(updated) = event else {
+            panic!("expected session.updated");
+        };
+
+        assert_eq!(updated.session.id, "sess_Aih6vAcY5Ddt6jwFx1tCa");
+        assert_eq!(updated.session.input_audio_format, AudioFormat::Pcm);
+        assert_eq!(updated.session.tools.len(), 1);
+    }
+
+    #[test]
+    fn parses_official_response_done_fixture() {
+        let event: ServerEvent = serde_json::from_str(OFFICIAL_SERVER_RESPONSE_DONE).unwrap();
+        let ServerEvent::ResponseDone(done) = event else {
+            panic!("expected response.done");
+        };
+
+        assert_eq!(done.response.status, ResponseStatus::Completed);
+        assert_eq!(done.response.output.len(), 1);
+    }
+
+    #[test]
+    fn parses_canceled_response_status() {
+        let fixture = OFFICIAL_SERVER_RESPONSE_DONE.replace("completed", "cancelled");
+        let event: ServerEvent = serde_json::from_str(&fixture).unwrap();
+        let ServerEvent::ResponseDone(done) = event else {
+            panic!("expected response.done");
+        };
+
+        assert_eq!(done.response.status, ResponseStatus::Canceled);
+    }
 
     #[test]
     fn serializes_audio_append_with_typed_payload() {
