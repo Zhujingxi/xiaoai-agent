@@ -4,11 +4,14 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::qwen_realtime::{AudioFormat, SampleRate};
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
     pub root: Option<PathBuf>,
     pub runtime: RuntimeConfig,
+    pub voice: RealtimeVoiceConfig,
     pub device: DeviceConfig,
     pub capture: CaptureConfig,
     pub asr: AsrConfig,
@@ -36,6 +39,7 @@ impl AppConfig {
         config.asr.open_ai.base_url = openai_base_url(&config.asr.open_ai.base_url);
         config.asr.openai_realtime.base_url =
             openai_realtime_base_url(&config.asr.openai_realtime.base_url);
+        config.voice.validate()?;
         Ok(config)
     }
 
@@ -45,6 +49,113 @@ impl AppConfig {
         };
         resolve_optional_path(root, &mut self.music.netease.cookie_file);
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct RealtimeVoiceConfig {
+    pub runtime: VoiceRuntime,
+    pub qwen: QwenRealtimeConfig,
+}
+
+impl RealtimeVoiceConfig {
+    pub fn validate(&self) -> Result<(), RealtimeVoiceConfigError> {
+        self.qwen.validate(self.runtime == VoiceRuntime::NativeQwen)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceRuntime {
+    #[default]
+    Legacy,
+    NativeQwen,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct QwenRealtimeConfig {
+    pub url: String,
+    pub api_key: String,
+    pub model: String,
+    pub voice: String,
+    pub input_audio_format: AudioFormat,
+    pub output_audio_format: AudioFormat,
+    pub input_sample_rate: SampleRate,
+    pub output_sample_rate: SampleRate,
+    pub connect_timeout_s: f64,
+    pub event_timeout_s: f64,
+}
+
+impl Default for QwenRealtimeConfig {
+    fn default() -> Self {
+        Self {
+            url: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime".to_string(),
+            api_key: "EMPTY".to_string(),
+            model: "qwen3.5-omni-plus-realtime".to_string(),
+            voice: "Cherry".to_string(),
+            input_audio_format: AudioFormat::Pcm16,
+            output_audio_format: AudioFormat::Pcm16,
+            input_sample_rate: SampleRate(16_000),
+            output_sample_rate: SampleRate(24_000),
+            connect_timeout_s: 10.0,
+            event_timeout_s: 30.0,
+        }
+    }
+}
+
+impl QwenRealtimeConfig {
+    fn validate(&self, enabled: bool) -> Result<(), RealtimeVoiceConfigError> {
+        if !self.url.starts_with("wss://") {
+            return Err(RealtimeVoiceConfigError::InvalidUrl);
+        }
+        if self.model.trim().is_empty() {
+            return Err(RealtimeVoiceConfigError::EmptyModel);
+        }
+        if self.voice.trim().is_empty() {
+            return Err(RealtimeVoiceConfigError::EmptyVoice);
+        }
+        if self.input_sample_rate.0 != 16_000 {
+            return Err(RealtimeVoiceConfigError::InvalidInputSampleRate(
+                self.input_sample_rate.0,
+            ));
+        }
+        if self.output_sample_rate.0 != 24_000 {
+            return Err(RealtimeVoiceConfigError::InvalidOutputSampleRate(
+                self.output_sample_rate.0,
+            ));
+        }
+        if !self.connect_timeout_s.is_finite() || self.connect_timeout_s <= 0.0 {
+            return Err(RealtimeVoiceConfigError::InvalidConnectTimeout);
+        }
+        if !self.event_timeout_s.is_finite() || self.event_timeout_s <= 0.0 {
+            return Err(RealtimeVoiceConfigError::InvalidEventTimeout);
+        }
+        if enabled && (self.api_key.trim().is_empty() || self.api_key == "EMPTY") {
+            return Err(RealtimeVoiceConfigError::MissingApiKey);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum RealtimeVoiceConfigError {
+    #[error("voice.qwen.url must use wss://")]
+    InvalidUrl,
+    #[error("voice.qwen.model must not be empty")]
+    EmptyModel,
+    #[error("voice.qwen.voice must not be empty")]
+    EmptyVoice,
+    #[error("voice.qwen.input_sample_rate must be 16000, got {0}")]
+    InvalidInputSampleRate(u32),
+    #[error("voice.qwen.output_sample_rate must be 24000, got {0}")]
+    InvalidOutputSampleRate(u32),
+    #[error("voice.qwen.connect_timeout_s must be finite and greater than zero")]
+    InvalidConnectTimeout,
+    #[error("voice.qwen.event_timeout_s must be finite and greater than zero")]
+    InvalidEventTimeout,
+    #[error("voice.qwen.api_key is required when voice.runtime is native_qwen")]
+    MissingApiKey,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -598,11 +709,41 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsrConfig, AsrProvider};
+    use super::{
+        AsrConfig, AsrProvider, RealtimeVoiceConfig, RealtimeVoiceConfigError, VoiceRuntime,
+    };
 
     #[test]
     fn parses_openai_realtime_provider_alias() {
         let config: AsrConfig = serde_yaml::from_str("provider: openai_realtime\n").unwrap();
         assert!(matches!(config.provider, AsrProvider::OpenAiRealtime));
+    }
+
+    #[test]
+    fn realtime_voice_defaults_to_legacy_and_validates() {
+        let config: RealtimeVoiceConfig = serde_yaml::from_str("{}\n").unwrap();
+        assert_eq!(config.runtime, VoiceRuntime::Legacy);
+        assert_eq!(config.qwen.input_sample_rate.0, 16_000);
+        assert_eq!(config.qwen.output_sample_rate.0, 24_000);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn native_qwen_requires_api_key() {
+        let config: RealtimeVoiceConfig = serde_yaml::from_str("runtime: native_qwen\n").unwrap();
+        assert_eq!(
+            config.validate(),
+            Err(RealtimeVoiceConfigError::MissingApiKey)
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_qwen_audio_rate() {
+        let config: RealtimeVoiceConfig =
+            serde_yaml::from_str("qwen:\n  input_sample_rate: 24000\n").unwrap();
+        assert_eq!(
+            config.validate(),
+            Err(RealtimeVoiceConfigError::InvalidInputSampleRate(24_000))
+        );
     }
 }

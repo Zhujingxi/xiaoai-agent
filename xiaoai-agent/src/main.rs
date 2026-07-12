@@ -10,6 +10,8 @@ mod mcp;
 mod mcp_legacy_sse;
 mod monitor;
 mod music;
+#[allow(dead_code)] // Typed protocol for the opt-in runtime added in a later commit.
+mod qwen_realtime;
 mod shell;
 mod tools;
 mod vad;
