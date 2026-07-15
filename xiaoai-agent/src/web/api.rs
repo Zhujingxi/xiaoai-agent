@@ -123,7 +123,9 @@ async fn put_config(
     payload: Result<Json<EditableConfig<SecretUpdate>>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(update) = payload.map_err(|error| ApiError::invalid_request(error.status()))?;
-    Ok(Json(state.store.save(update).await?))
+    let response = state.store.save(update).await?;
+    tracing::info!(target: "xiaoai_agent::web_status", "configuration saved");
+    Ok(Json(response))
 }
 
 async fn get_status(State(state): State<WebState>) -> impl IntoResponse {
@@ -144,6 +146,7 @@ async fn get_logs(
 async fn restart(State(state): State<WebState>) -> Result<impl IntoResponse, ApiError> {
     let _guard = state.store.operation_lock().await;
     state.restarter.schedule_restart()?;
+    tracing::info!(target: "xiaoai_agent::web_status", "restart scheduled");
     Ok((
         StatusCode::ACCEPTED,
         Json(RestartResponse { restarting: true }),
@@ -168,6 +171,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use serde_json::Value;
     use tower::ServiceExt;
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
 
     use super::router;
     use crate::config::AppConfig;
@@ -192,6 +196,7 @@ mod tests {
         config_path: std::path::PathBuf,
         store: Arc<ConfigStore>,
         restart_calls: Arc<AtomicUsize>,
+        state: WebState,
     }
 
     async fn test_router(override_yaml: &str) -> (axum::Router, TestFixture) {
@@ -230,6 +235,7 @@ mod tests {
                 calls: restart_calls.clone(),
             }),
         };
+        let fixture_state = state.clone();
 
         (
             router(state),
@@ -238,6 +244,7 @@ mod tests {
                 config_path: path,
                 store,
                 restart_calls,
+                state: fixture_state,
             },
         )
     }
@@ -412,6 +419,47 @@ airplay:
             response_json(response).await,
             serde_json::json!({"restarting": true})
         );
+    }
+
+    #[tokio::test]
+    async fn successful_mutations_emit_only_fixed_safe_status_events() {
+        let (_app, fixture) = test_router("").await;
+        let private_request_value = "private-request-value-must-not-be-logged";
+        let mut update = crate::web::config_store::EditableConfig::from_app(
+            &AppConfig::load(&fixture.config_path).unwrap(),
+        )
+        .into_update_keep_secrets();
+        update.llm.model = private_request_value.to_string();
+
+        let event_logs = LogBuffer::new(10, 2048);
+        let web_log_writer = event_logs
+            .clone()
+            .with_filter(|metadata| metadata.target() == "xiaoai_agent::web_status");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(web_log_writer)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!("ordinary log with {private_request_value}");
+        assert!(super::put_config(
+            axum::extract::State(fixture.state.clone()),
+            Ok(axum::Json(update)),
+        )
+        .await
+        .is_ok());
+        assert!(super::restart(axum::extract::State(fixture.state.clone()))
+            .await
+            .is_ok());
+
+        let entries = event_logs.entries(10);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("configuration saved"));
+        assert!(entries[1].contains("restart scheduled"));
+        let combined = entries.join("\n");
+        assert!(!combined.contains(private_request_value));
+        assert!(!combined.contains(&fixture.config_path.display().to_string()));
     }
 
     #[tokio::test]
