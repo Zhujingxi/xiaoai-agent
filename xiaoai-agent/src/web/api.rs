@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_serves_only_the_minimal_html_smoke_document() {
+    async fn index_serves_the_configuration_page() {
         let (app, _fixture) = test_router("").await;
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -276,10 +276,27 @@ mod tests {
             response.headers()["content-type"],
             "text/html; charset=utf-8"
         );
-        let bytes = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+        let bytes = to_bytes(response.into_body(), 128 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(body.contains(r#"<main id="app">XiaoAI Agent</main>"#));
-        assert!(!body.contains("<script"));
+        for marker in [
+            "XiaoAI Agent 配置",
+            "运行状态",
+            "语音与模型",
+            "工具与可选功能",
+            "常规设置",
+            "高级与调试信息",
+            "保存配置",
+            "重启服务",
+            "data-provider-section",
+            "loadConfig",
+            "saveConfig",
+            "restartAgent",
+        ] {
+            assert!(body.contains(marker), "missing marker: {marker}");
+        }
+        for forbidden in ["react", "vue", "bootstrap", "tailwind", "websocket"] {
+            assert!(!body.to_ascii_lowercase().contains(forbidden));
+        }
     }
 
     #[tokio::test]
