@@ -291,9 +291,35 @@ mod tests {
             "loadConfig",
             "saveConfig",
             "restartAgent",
+            "const RESTART_TIMEOUT_MS = 30000",
+            "new AbortController()",
+            "deadline - Date.now()",
+            "timeoutMs: remaining",
+            "pageState.pendingRestart",
+            "restartRequired || pageState.pendingRestart",
         ] {
             assert!(body.contains(marker), "missing marker: {marker}");
         }
+        for label in [
+            "清除 Qwen API 密钥",
+            "清除 OpenAI 兼容 ASR API 密钥",
+            "清除 OpenAI 实时转写 API 密钥",
+            "清除 LLM API 密钥",
+            "清除 QWeather 请求 URL",
+            "清除 Tavily API 密钥",
+            "清除 Home Assistant 访问令牌",
+            "清除 Navidrome 密码",
+            "清除网易云音乐密码",
+            "清除网易云音乐 MD5 密码",
+            "清除 AirPlay 密码",
+        ] {
+            assert!(
+                body.contains(&format!(r#"aria-label="{label}""#)),
+                "missing accessible secret action: {label}"
+            );
+        }
+        assert_eq!(body.matches("data-clear-secret=").count(), 11);
+        assert_eq!(body.matches(r#"aria-label="清除"#).count(), 11);
         for forbidden in ["react", "vue", "bootstrap", "tailwind", "websocket"] {
             assert!(!body.to_ascii_lowercase().contains(forbidden));
         }
