@@ -930,18 +930,34 @@ fn replace_formal_file(temp_path: &Path, formal_path: &Path) -> std::io::Result<
     std::fs::rename(temp_path, formal_path)
 }
 
-#[cfg(windows)]
-fn replace_formal_file(temp_path: &Path, formal_path: &Path) -> std::io::Result<()> {
-    let old_path = formal_path.with_file_name(format!(
-        "{}.replace-old",
+#[cfg(any(windows, test))]
+fn replacement_old_path(formal_path: &Path) -> PathBuf {
+    formal_path.with_file_name(format!(
+        ".{}-{}-{}.replace-old",
         formal_path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("agent.yaml")
-    ));
-    std::fs::rename(formal_path, &old_path)?;
-    if let Err(replace_error) = std::fs::rename(temp_path, formal_path) {
-        return match std::fs::rename(&old_path, formal_path) {
+            .unwrap_or("agent.yaml"),
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn replace_via_old_path<R, C>(
+    temp_path: &Path,
+    formal_path: &Path,
+    old_path: &Path,
+    mut rename: R,
+    cleanup_old: C,
+) -> std::io::Result<()>
+where
+    R: FnMut(&Path, &Path) -> std::io::Result<()>,
+    C: FnOnce(&Path) -> std::io::Result<()>,
+{
+    rename(formal_path, old_path)?;
+    if let Err(replace_error) = rename(temp_path, formal_path) {
+        return match rename(old_path, formal_path) {
             Ok(()) => Err(replace_error),
             Err(restore_error) => Err(std::io::Error::new(
                 restore_error.kind(),
@@ -951,7 +967,23 @@ fn replace_formal_file(temp_path: &Path, formal_path: &Path) -> std::io::Result<
             )),
         };
     }
-    std::fs::remove_file(old_path)
+
+    // The new formal file is committed. Cleanup must not turn that success into
+    // an error; a future attempt uses a different collision-safe old path.
+    let _ = cleanup_old(old_path);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_formal_file(temp_path: &Path, formal_path: &Path) -> std::io::Result<()> {
+    let old_path = replacement_old_path(formal_path);
+    replace_via_old_path(
+        temp_path,
+        formal_path,
+        &old_path,
+        |from, to| std::fs::rename(from, to),
+        std::fs::remove_file,
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1461,6 +1493,49 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn committed_replacement_ignores_old_file_cleanup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let formal_path = dir.path().join("agent.yaml");
+        let temp_path = dir.path().join("candidate.tmp");
+        let old_path = dir.path().join("candidate.replace-old");
+        std::fs::write(&formal_path, b"old").unwrap();
+        std::fs::write(&temp_path, b"new").unwrap();
+
+        let result = replace_via_old_path(
+            &temp_path,
+            &formal_path,
+            &old_path,
+            |from, to| std::fs::rename(from, to),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cleanup failure",
+                ))
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read(&formal_path).unwrap(), b"new");
+        assert_eq!(std::fs::read(&old_path).unwrap(), b"old");
+    }
+
+    #[test]
+    fn replacement_old_paths_do_not_collide_with_prior_cleanup_failures() {
+        let formal_path = std::path::Path::new("agent.yaml");
+
+        let first = replacement_old_path(formal_path);
+        let second = replacement_old_path(formal_path);
+
+        assert_ne!(first, second);
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".replace-old"));
+        assert_eq!(first.parent(), formal_path.parent());
     }
 
     #[tokio::test]
