@@ -1,0 +1,47 @@
+{
+  "event_id": "event_X1HsXS4b4uptp6yo1LgKd",
+  "type": "session.updated",
+  "session": {
+    "id": "sess_Aih6vAcY5Ddt6jwFx1tCa",
+    "object": "realtime.session",
+    "model": "qwen3-omni-flash-realtime",
+    "modalities": ["text", "audio"],
+    "instructions": "你是个人助理小云，请你准确且友好地解答用户的问题，始终以乐于助人的态度回应。",
+    "voice": "Cherry",
+    "input_audio_format": "pcm",
+    "output_audio_format": "pcm",
+    "input_audio_transcription": {"model": "qwen3-asr-flash-realtime"},
+    "turn_detection": {
+      "type": "server_vad",
+      "threshold": 0.1,
+      "prefix_padding_ms": 500,
+      "silence_duration_ms": 900,
+      "create_response": true,
+      "interrupt_response": true
+    },
+    "enable_search": true,
+    "search_options": {"enable_source": true},
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_current_weather",
+        "description": "当你想查询指定城市的天气时非常有用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string", "description": "城市名称"}
+          },
+          "required": ["location"]
+        }
+      }
+    }],
+    "temperature": 0.8,
+    "max_response_output_token": "inf",
+    "max_tokens": 16384,
+    "repetition_penalty": 1.05,
+    "presence_penalty": 0.0,
+    "top_k": 50,
+    "top_p": 1.0,
+    "seed": -1
+  }
+}

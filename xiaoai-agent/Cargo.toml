@@ -21,6 +21,7 @@ clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 libloading = "0.8"
 md5 = "0.7"
+nix = { version = "0.30", features = ["signal"] }
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["gzip", "json", "multipart", "rustls", "stream"] }
 rig-core = { version = "0.39", features = ["rmcp"] }

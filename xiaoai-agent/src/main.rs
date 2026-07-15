@@ -10,6 +10,8 @@ mod mcp;
 mod mcp_legacy_sse;
 mod monitor;
 mod music;
+mod qwen_realtime;
+mod qwen_voice;
 mod shell;
 mod tools;
 mod vad;
@@ -33,10 +35,11 @@ use crate::airplay::AirPlayService;
 use crate::asr::AsrClient;
 use crate::audio::record::AudioRecorder;
 use crate::capture::{record_utterance, record_utterance_streaming};
-use crate::config::{AppConfig, DeviceConfig};
+use crate::config::{AppConfig, CaptureConfig, DeviceConfig, QwenRealtimeConfig, VoiceRuntime};
 use crate::device::Device;
 use crate::monitor::kws::{KwsMonitor, KwsMonitorEvent};
 use crate::music::MusicService;
+use crate::qwen_voice::{QwenVoiceService, SessionHandle};
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
 const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，请稍后重试";
@@ -47,6 +50,36 @@ const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，�
 struct Cli {
     #[arg(short, long, default_value = "/data/open-xiaoai/agent.yaml")]
     config: PathBuf,
+}
+
+struct ActiveTurn {
+    task: JoinHandle<()>,
+    native_session: Option<SessionHandle>,
+}
+
+impl ActiveTurn {
+    fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    async fn cancel(mut self) {
+        if let Some(session) = self.native_session.take() {
+            let _ = session.cancel().await;
+            if let Err(err) = self.task.await {
+                warn!("cancelled Qwen turn task ended unexpectedly: {err:?}");
+            }
+        } else if !self.task.is_finished() {
+            self.task.abort();
+        } else if let Err(err) = self.task.await {
+            warn!("turn task ended unexpectedly: {err:?}");
+        }
+    }
+
+    async fn join(self) {
+        if let Err(err) = self.task.await {
+            warn!("turn task ended unexpectedly: {err:?}");
+        }
+    }
 }
 
 #[tokio::main]
@@ -66,6 +99,13 @@ async fn main() -> anyhow::Result<()> {
     let music = Arc::new(MusicService::new(config.clone(), device.clone())?);
     let airplay = AirPlayService::start(config.airplay.clone()).await?;
     let agent = Arc::new(AgentRuntime::new(config.clone(), device.clone(), music.clone()).await?);
+    let qwen_voice = build_qwen_voice_service(
+        config.voice.runtime,
+        config.voice.qwen.clone(),
+        config.capture.clone(),
+        agent.tool_server(),
+        agent.native_mcp_client(),
+    );
 
     let (kws_tx, mut kws_rx) = mpsc::channel::<KwsMonitorEvent>(16);
     let mut kws = KwsMonitor::new();
@@ -76,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         .blink_ready(config.device.led_listening, Duration::from_millis(250))
         .await;
 
-    let mut active_turn: Option<JoinHandle<()>> = None;
+    let mut active_turn: Option<ActiveTurn> = None;
     let mut turn_check = interval(Duration::from_millis(250));
     turn_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -87,12 +127,8 @@ async fn main() -> anyhow::Result<()> {
                     KwsMonitorEvent::Started => info!("KWS monitor started"),
                     KwsMonitorEvent::Keyword(keyword) => {
                         info!("WAKE keyword={keyword}");
-                        if let Some(handle) = active_turn.take() {
-                            if !handle.is_finished() {
-                                handle.abort();
-                            } else if let Err(err) = handle.await {
-                                warn!("turn task ended unexpectedly: {err:?}");
-                            }
+                        if let Some(turn) = active_turn.take() {
+                            turn.cancel().await;
                         }
                         let _ = AudioRecorder::instance().stop_recording().await;
                         let music_interrupted = music.interrupt_for_wake().await;
@@ -103,19 +139,41 @@ async fn main() -> anyhow::Result<()> {
                         cleanup_turn_leds(&device, &config.device).await;
                         agent.reset_session("wake keyword").await;
 
-                        let state = TurnState {
-                            config: config.clone(),
-                            device: device.clone(),
-                            asr: asr.clone(),
-                            agent: agent.clone(),
-                            music: music.clone(),
-                            airplay: airplay.clone(),
+                        active_turn = if let Some(qwen) = qwen_voice.clone() {
+                            let device = device.clone();
+                            let device_config = config.device.clone();
+                            let idle_timeout = Duration::from_secs_f64(
+                                config.runtime.session_idle_timeout_s.max(1.0),
+                            );
+                            let session = qwen.prepare_session(idle_timeout)?;
+                            let native_session = session.handle();
+                            Some(ActiveTurn {
+                                task: tokio::spawn(async move {
+                                    if let Err(err) = session.run().await {
+                                        error!("native Qwen voice session failed: {err:?}");
+                                    }
+                                    cleanup_turn_leds(&device, &device_config).await;
+                                }),
+                                native_session: Some(native_session),
+                            })
+                        } else {
+                            let state = TurnState {
+                                config: config.clone(),
+                                device: device.clone(),
+                                asr: asr.clone(),
+                                agent: agent.clone(),
+                                music: music.clone(),
+                                airplay: airplay.clone(),
+                            };
+                            Some(ActiveTurn {
+                                task: tokio::spawn(async move {
+                                    if let Err(err) = run_turn(state).await {
+                                        error!("turn failed: {err:?}");
+                                    }
+                                }),
+                                native_session: None,
+                            })
                         };
-                        active_turn = Some(tokio::spawn(async move {
-                            if let Err(err) = run_turn(state).await {
-                                error!("turn failed: {err:?}");
-                            }
-                        }));
                     }
                 }
             }
@@ -126,9 +184,7 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(false);
                 if turn_finished {
                     if let Some(handle) = active_turn.take() {
-                        if let Err(err) = handle.await {
-                            warn!("turn task ended unexpectedly: {err:?}");
-                        }
+                        handle.join().await;
                     }
                     device
                         .blink_ready(config.device.led_listening, Duration::from_millis(250))
@@ -345,4 +401,43 @@ fn choose_acknowledge_text(options: &[String]) -> Option<String> {
     choices
         .choose(&mut rand::thread_rng())
         .map(|text| (*text).to_string())
+}
+
+fn uses_native_qwen(runtime: VoiceRuntime) -> bool {
+    matches!(runtime, VoiceRuntime::NativeQwen)
+}
+
+fn build_qwen_voice_service(
+    runtime: VoiceRuntime,
+    config: QwenRealtimeConfig,
+    capture: CaptureConfig,
+    tool_server: rig_core::tool::server::ToolServerHandle,
+    native_mcp: Option<crate::mcp::NativeMcpClient>,
+) -> Option<QwenVoiceService> {
+    uses_native_qwen(runtime)
+        .then(|| QwenVoiceService::new(config, capture, tool_server).with_native_mcp(native_mcp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_runtime_routes_legacy_and_native_behavior_separately() {
+        let config = QwenRealtimeConfig::default();
+        let capture = CaptureConfig::default();
+        let tools = rig_core::tool::server::ToolServer::new().run();
+        assert!(build_qwen_voice_service(
+            VoiceRuntime::Legacy,
+            config.clone(),
+            capture.clone(),
+            tools.clone(),
+            None,
+        )
+        .is_none());
+        assert!(
+            build_qwen_voice_service(VoiceRuntime::NativeQwen, config, capture, tools, None)
+                .is_some()
+        );
+    }
 }

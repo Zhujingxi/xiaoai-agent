@@ -11,7 +11,7 @@ use tracing::warn;
 
 use crate::config::{timeout_duration, AppConfig};
 use crate::device::Device;
-use crate::mcp::McpConnections;
+use crate::mcp::{McpConnections, NativeMcpClient};
 use crate::music::MusicService;
 use crate::tools::*;
 
@@ -62,7 +62,7 @@ pub struct AgentControl {
 pub struct AgentRuntime {
     config: Arc<AppConfig>,
     tool_server: ToolServerHandle,
-    _mcp: McpConnections,
+    mcp: McpConnections,
     history: Mutex<Vec<(String, String)>>,
     control: Arc<Mutex<AgentControl>>,
 }
@@ -102,7 +102,7 @@ impl AgentRuntime {
         Ok(Self {
             config,
             tool_server,
-            _mcp: mcp,
+            mcp,
             history: Mutex::new(Vec::new()),
             control,
         })
@@ -150,6 +150,14 @@ impl AgentRuntime {
             should_end: control.should_end,
             end_reason: control.end_reason.clone(),
         })
+    }
+
+    pub fn tool_server(&self) -> ToolServerHandle {
+        self.tool_server.clone()
+    }
+
+    pub fn native_mcp_client(&self) -> Option<NativeMcpClient> {
+        self.mcp.native_client()
     }
 
     async fn prompt_once(&self, prompt: String) -> anyhow::Result<String> {

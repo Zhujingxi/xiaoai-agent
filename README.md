@@ -100,10 +100,28 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
   `openai_realtime` 时，录音链路会在 VAD 采集期间持续发送
   `input_audio_buffer.append`，并在一句话结束后 `commit` 等待最终文本
 - `llm.base_url`、`llm.api_key`、`llm.model`：大模型服务配置
-- `mcp.home_assistant`：Home Assistant MCP 配置
+- `voice.runtime`：语音运行时。默认 `legacy` 保留现有的 ASR → 文本 Agent →
+  设备 TTS 链路；`native_qwen` 改用 Qwen3.5 Omni Realtime 的双向音频链路，
+  此时必须配置 `voice.qwen.api_key`
+- `voice.qwen`：原生 Qwen Realtime 的 WebSocket、模型、音色和 PCM 参数。
+  输入固定为 16 kHz 单声道 S16_LE，输出固定为 24 kHz 单声道 S16_LE；
+  `tool_timeout_s`、`max_tool_calls` 和 `max_tool_iterations` 为每轮工具执行设置
+  超时与上限，防止模型无限递归调用
+- `mcp.home_assistant`：Home Assistant MCP 配置；`timeout_s` 除了限制旧版 SSE
+  传输，也限制原生 Qwen 启动时的工具发现和后续工具列表刷新。发现或刷新超时后
+  连接会关闭并保持 fail-closed，不会回退到可能重复执行的通用 MCP 代理路径
 - `music`：音乐服务配置，推荐使用 Navidrome；不需要音乐功能时保持 `music.enabled: false`
 - `runtime` / `capture`：唤醒和录音参数，通常先使用示例值
 - `airplay`：AirPlay 音频输出配置，默认关闭
+
+选择 `native_qwen` 时，程序会把文本 Agent 已注册的内置工具和 MCP 工具定义
+转换为 Qwen Realtime function tools。模型返回函数调用后，程序通过同一个 Rig
+`ToolServerHandle` 执行工具，将结构化结果作为 `function_call_output` 写回原会话，
+再请求模型继续生成最终语音。`call_id` 在整轮会话中只能使用一次，后续迭代重放会
+直接终止该会话且不会再次执行工具；大小限制内的畸形或非对象 JSON 参数不会调用
+MCP，而会作为 `invalid_arguments` 结构化错误返回模型。未知工具、MCP 错误和超时也
+会作为结构化错误返回模型。工具执行和 WebSocket 发送均响应会话取消。
+`legacy` 运行时不启用此原生循环，行为保持不变。
 
 ### 5. 安装到音箱
 

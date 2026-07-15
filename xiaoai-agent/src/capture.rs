@@ -16,6 +16,29 @@ use crate::vad::{SpeechCollector, SpeechEvent};
 const VPM_STATUS_ASR_START: i32 = 2;
 const VPM_STATUS_ASR_END: i32 = 3;
 
+struct VpmAsrGuard {
+    set_status: fn(i32) -> bool,
+}
+
+impl VpmAsrGuard {
+    fn start() -> Self {
+        if !request_vpm_status(VPM_STATUS_ASR_START) {
+            warn!("failed to request VPM ASR_START status");
+        }
+        Self {
+            set_status: request_vpm_status,
+        }
+    }
+}
+
+impl Drop for VpmAsrGuard {
+    fn drop(&mut self) {
+        if !(self.set_status)(VPM_STATUS_ASR_END) {
+            warn!("failed to request VPM ASR_END status");
+        }
+    }
+}
+
 pub async fn record_utterance<F, Fut>(
     config: CaptureConfig,
     idle_timeout: Duration,
@@ -163,14 +186,8 @@ where
 {
     let rx = subscribe_vpm_asr_audio()
         .context("VPM ASR audio stream is unavailable; native KWS monitor is not ready")?;
-    if !request_vpm_status(VPM_STATUS_ASR_START) {
-        warn!("failed to request VPM ASR_START status");
-    }
-    let result = collect_vpm_asr_utterance(config, idle_timeout, on_speech_start, rx).await;
-    if !request_vpm_status(VPM_STATUS_ASR_END) {
-        warn!("failed to request VPM ASR_END status");
-    }
-    result
+    let _asr_guard = VpmAsrGuard::start();
+    collect_vpm_asr_utterance(config, idle_timeout, on_speech_start, rx).await
 }
 
 async fn record_vpm_asr_utterance_streaming<F, Fut, C, CFut, R, RFut>(
@@ -190,10 +207,8 @@ where
 {
     let rx = subscribe_vpm_asr_audio()
         .context("VPM ASR audio stream is unavailable; native KWS monitor is not ready")?;
-    if !request_vpm_status(VPM_STATUS_ASR_START) {
-        warn!("failed to request VPM ASR_START status");
-    }
-    let result = collect_vpm_asr_utterance_streaming(
+    let _asr_guard = VpmAsrGuard::start();
+    collect_vpm_asr_utterance_streaming(
         config,
         idle_timeout,
         on_speech_start,
@@ -201,11 +216,7 @@ where
         on_speech_rejected,
         rx,
     )
-    .await;
-    if !request_vpm_status(VPM_STATUS_ASR_END) {
-        warn!("failed to request VPM ASR_END status");
-    }
-    result
+    .await
 }
 
 async fn collect_vpm_asr_utterance<F, Fut>(
@@ -381,4 +392,51 @@ where
 
 fn is_vpm_asr_capture(pcm: &str) -> bool {
     matches!(pcm.trim(), "vpm_asr" | "vpm")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+
+    use super::*;
+
+    static LAST_STATUS: AtomicI32 = AtomicI32::new(0);
+    static END_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_status(status: i32) -> bool {
+        LAST_STATUS.store(status, Ordering::SeqCst);
+        if status == VPM_STATUS_ASR_END {
+            END_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn real_vpm_stream_abort_sends_asr_end_once_before_join_completes() {
+        LAST_STATUS.store(0, Ordering::SeqCst);
+        END_COUNT.store(0, Ordering::SeqCst);
+        let (_audio_tx, audio_rx) = broadcast::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = VpmAsrGuard {
+                set_status: record_status,
+            };
+            started_tx.send(()).unwrap();
+            collect_vpm_asr_utterance_streaming(
+                CaptureConfig::default(),
+                Duration::from_secs(30),
+                || async {},
+                |_bytes| async { Ok(()) },
+                || async { Ok(()) },
+                audio_rx,
+            )
+            .await
+        });
+
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(LAST_STATUS.load(Ordering::SeqCst), VPM_STATUS_ASR_END);
+        assert_eq!(END_COUNT.load(Ordering::SeqCst), 1);
+    }
 }
