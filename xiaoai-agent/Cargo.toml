@@ -2,6 +2,7 @@
 name = "xiaoai-agent"
 version = "0.1.0"
 edition = "2021"
+default-run = "xiaoai-agent"
 license = "LGPL-3.0-or-later"
 
 [profile.release]

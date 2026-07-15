@@ -346,7 +346,7 @@ fn main() -> Result<()> {
             eprintln!("--no-audio set; initialized libvpm only");
             Ok(())
         } else {
-            run_audio_loop(&args, &*vpm_process)
+            run_audio_loop(&args, &vpm_process)
         };
 
         if !args.no_stop_status {
@@ -411,9 +411,12 @@ fn run_audio_loop(args: &Args, vpm_process: &VpmProcess) -> Result<()> {
         }
 
         if let Err(err) = reader.read_exact(&mut buf) {
-            if args.raw_file.is_some() && err.kind() == ErrorKind::UnexpectedEof {
+            if let Some(path) = args
+                .raw_file
+                .as_ref()
+                .filter(|_| err.kind() == ErrorKind::UnexpectedEof)
+            {
                 if args.loop_raw_file {
-                    let path = args.raw_file.as_ref().expect("raw_file checked above");
                     reader = Box::new(
                         std::fs::File::open(path)
                             .with_context(|| format!("reopen raw file {path}"))?,
@@ -452,7 +455,7 @@ fn run_audio_loop(args: &Args, vpm_process: &VpmProcess) -> Result<()> {
             std::thread::sleep(Duration::from_millis(u64::from(args.frame_ms)));
         }
 
-        if frames % 500 == 0 {
+        if frames.is_multiple_of(500) {
             eprintln!(
                 "fed {frames} frames, callbacks={}, kws_events={}",
                 CALLBACK_COUNT.load(Ordering::Relaxed),

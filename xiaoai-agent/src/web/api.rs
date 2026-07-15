@@ -72,7 +72,11 @@ impl From<RestartError> for ApiError {
             RestartError::AlreadyScheduled => {
                 Self::new(StatusCode::CONFLICT, "restart_already_scheduled", None)
             }
-            RestartError::Unsupported | RestartError::CurrentExe(_) | RestartError::Spawn(_) => {
+            #[cfg(not(unix))]
+            RestartError::Unsupported => {
+                Self::new(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", None)
+            }
+            RestartError::CurrentExe(_) | RestartError::Spawn(_) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", None)
             }
         }

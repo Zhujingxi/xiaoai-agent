@@ -59,6 +59,7 @@ pub enum ConfigStoreError {
 }
 
 impl ConfigStoreError {
+    #[cfg(test)]
     pub fn field(&self) -> Option<&str> {
         match self {
             Self::Field { field, .. } => Some(field),
@@ -632,6 +633,7 @@ impl ConfigStore {
         }
     }
 
+    #[cfg(test)]
     pub fn restart_required_flag(&self) -> Arc<AtomicBool> {
         self.restart_required.clone()
     }

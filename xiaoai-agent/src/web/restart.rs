@@ -11,6 +11,7 @@ pub trait RestartController: Send + Sync {
 pub enum RestartError {
     #[error("restart is already scheduled")]
     AlreadyScheduled,
+    #[cfg(not(unix))]
     #[error("self restart is supported only on Unix targets")]
     Unsupported,
     #[error("failed to locate current executable: {0}")]

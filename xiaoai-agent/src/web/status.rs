@@ -27,9 +27,7 @@ impl LogBuffer {
     }
 
     pub fn push(&self, message: impl AsRef<str>) {
-        let message = message
-            .as_ref()
-            .trim_end_matches(|character| character == '\r' || character == '\n');
+        let message = message.as_ref().trim_end_matches(['\r', '\n']);
         if message.is_empty() {
             return;
         }

@@ -564,7 +564,7 @@ fn send_vpm_asr_audio(bytes: Vec<u8>) {
 
 fn log_vpm_asr_packet(data_type: u32, size: u32) {
     let packet = VPM_ASR_AUDIO_PACKET_COUNT.fetch_add(1, Ordering::Relaxed);
-    if packet < 8 || packet % 50 == 0 {
+    if packet < 8 || packet.is_multiple_of(50) {
         debug!(packet, data_type, size, "VPM_ASR_CALLBACK_PACKET");
     }
 }
