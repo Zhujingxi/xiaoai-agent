@@ -16,6 +16,7 @@ mod shell;
 mod tools;
 mod vad;
 mod weather;
+mod web;
 
 use std::path::PathBuf;
 use std::sync::Arc;
