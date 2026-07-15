@@ -35,6 +35,9 @@ impl LogBuffer {
         }
 
         let message = truncate_chars(message, self.max_chars);
+        if message.is_empty() {
+            return;
+        }
         let mut entries = lock_recover(&self.entries);
         entries.push_back(message);
         while entries.len() > self.capacity {
@@ -100,7 +103,6 @@ pub struct StatusSnapshot {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug)]
 pub struct RuntimeStatus {
     started_at: SystemTime,
     started: Instant,
@@ -243,6 +245,13 @@ mod tests {
         logs.push("second");
         logs.push("third");
         assert_eq!(logs.entries(200), vec!["second", "third"]);
+    }
+
+    #[test]
+    fn log_buffer_ignores_entries_truncated_to_empty() {
+        let logs = LogBuffer::new(2, 0);
+        logs.push("not empty before truncation");
+        assert!(logs.entries(200).is_empty());
     }
 
     #[test]
