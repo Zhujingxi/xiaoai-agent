@@ -1,20 +1,23 @@
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Context;
 use base64::Engine as _;
-use futures::{SinkExt, StreamExt};
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, SinkExt, StreamExt};
+use rig_core::tool::server::ToolServerHandle;
+use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
-#[cfg(test)]
-use tokio::sync::oneshot;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep_until, timeout, Instant};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
@@ -23,11 +26,15 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::agent::SPEAKER_AGENT_INSTRUCTIONS;
 use crate::audio::record::AudioRecorder;
 use crate::capture::record_utterance_streaming;
 use crate::config::{timeout_duration, CaptureConfig, QwenRealtimeConfig};
+use crate::mcp::{NativeMcpCallError, NativeMcpClient};
 use crate::qwen_realtime::{
-    AudioFormat, Base64Pcm, ClientEvent, Modality, ResponseId, ServerEvent, SessionUpdate,
+    AudioFormat, Base64Pcm, CallId, ClientEvent, ConversationItem, FunctionCallOutput,
+    FunctionDefinition, Modality, ResponseId, ResponseOutputItem, ResponseStatus, ServerEvent,
+    SessionUpdate, ToolDefinition,
 };
 
 const UPLOAD_QUEUE_CAPACITY: usize = 32;
@@ -38,7 +45,14 @@ const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const CANCEL_EVENT_TIMEOUT: Duration = Duration::from_millis(250);
 const SESSION_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+const NATIVE_MCP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const GENERIC_TOOL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const GENERIC_TOOL_COOPERATIVE_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const RECONNECT_ATTEMPTS: usize = 2;
+const MAX_CALL_ID_BYTES: usize = 256;
+const MAX_TOOL_NAME_BYTES: usize = 256;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -494,11 +508,24 @@ impl QwenSessionTurn {
     pub async fn run(self) -> anyhow::Result<()> {
         let config = self.service.config.clone();
         let capture = self.service.capture.clone();
+        let tools = NativeToolRuntime::load_with_native_mcp(
+            &config,
+            self.service.tool_server.clone(),
+            self.service.native_mcp.clone(),
+        )
+        .await?;
         self.service
             .run_prepared_supervised_session(
                 self.control,
                 move |cancel_rx, setup_phase| {
-                    run_realtime_session(config, capture, self.idle_timeout, cancel_rx, setup_phase)
+                    run_realtime_session(
+                        config,
+                        capture,
+                        tools,
+                        self.idle_timeout,
+                        cancel_rx,
+                        setup_phase,
+                    )
                 },
                 SESSION_CANCEL_TIMEOUT,
             )
@@ -594,18 +621,31 @@ impl Drop for SessionWaiterGuard {
 pub struct QwenVoiceService {
     config: QwenRealtimeConfig,
     capture: CaptureConfig,
+    tool_server: ToolServerHandle,
+    native_mcp: Option<NativeMcpClient>,
     active: Arc<Mutex<Option<ActiveSession>>>,
     next_session_id: Arc<AtomicU64>,
 }
 
 impl QwenVoiceService {
-    pub fn new(config: QwenRealtimeConfig, capture: CaptureConfig) -> Self {
+    pub fn new(
+        config: QwenRealtimeConfig,
+        capture: CaptureConfig,
+        tool_server: ToolServerHandle,
+    ) -> Self {
         Self {
             config,
             capture,
+            tool_server,
+            native_mcp: None,
             active: Arc::new(Mutex::new(None)),
             next_session_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    pub fn with_native_mcp(mut self, native_mcp: Option<NativeMcpClient>) -> Self {
+        self.native_mcp = native_mcp;
+        self
     }
 
     #[cfg(test)]
@@ -767,6 +807,341 @@ impl QwenVoiceService {
     }
 }
 
+#[derive(Clone)]
+struct NativeToolRuntime {
+    server: ToolServerHandle,
+    native_mcp: Option<NativeMcpClient>,
+    definitions: Vec<ToolDefinition>,
+    call_timeout: Duration,
+    max_calls: usize,
+    max_iterations: usize,
+    effects_observed: Arc<AtomicBool>,
+    generic_calls: Arc<GenericToolState>,
+}
+
+#[derive(Default)]
+struct GenericToolState {
+    active_calls: AtomicU64,
+    idle: tokio::sync::Notify,
+    fail_closed: AtomicBool,
+}
+
+struct ActiveGenericToolCall(Arc<GenericToolState>);
+
+impl Drop for ActiveGenericToolCall {
+    fn drop(&mut self) {
+        self.0.active_calls.fetch_sub(1, Ordering::SeqCst);
+        self.0.idle.notify_waiters();
+    }
+}
+
+enum GenericToolResult {
+    Completed(Result<String, String>),
+    Cancelled,
+}
+
+struct GenericToolCall {
+    cancel_tx: Option<watch::Sender<bool>>,
+    result_rx: oneshot::Receiver<GenericToolResult>,
+    state: Arc<GenericToolState>,
+}
+
+impl GenericToolCall {
+    async fn wait(mut self, deadline: Duration) -> anyhow::Result<String> {
+        match timeout(deadline, &mut self.result_rx).await {
+            Ok(Ok(GenericToolResult::Completed(result))) => {
+                self.cancel_tx.take();
+                result.map_err(anyhow::Error::msg)
+            }
+            Ok(Ok(GenericToolResult::Cancelled)) => {
+                self.cancel_tx.take();
+                anyhow::bail!("generic tool call was cancelled")
+            }
+            Ok(Err(_)) => anyhow::bail!("generic tool supervisor stopped unexpectedly"),
+            Err(_) => {
+                self.state.fail_closed.store(true, Ordering::SeqCst);
+                if let Some(cancel_tx) = self.cancel_tx.take() {
+                    let _ = cancel_tx.send(true);
+                }
+                anyhow::ensure!(
+                    timeout(GENERIC_TOOL_CLEANUP_TIMEOUT, &mut self.result_rx)
+                        .await
+                        .is_ok(),
+                    "timed out cleaning up generic tool call"
+                );
+                anyhow::bail!(
+                    "generic tool deadline exceeded; turn failed closed after cancellation"
+                )
+            }
+        }
+    }
+}
+
+impl Drop for GenericToolCall {
+    fn drop(&mut self) {
+        if let Some(cancel_tx) = self.cancel_tx.take() {
+            let _ = cancel_tx.send(true);
+        }
+    }
+}
+
+impl NativeToolRuntime {
+    #[cfg(test)]
+    async fn load(config: &QwenRealtimeConfig, server: ToolServerHandle) -> anyhow::Result<Self> {
+        Self::load_with_native_mcp(config, server, None).await
+    }
+
+    async fn load_with_native_mcp(
+        config: &QwenRealtimeConfig,
+        server: ToolServerHandle,
+        native_mcp: Option<NativeMcpClient>,
+    ) -> anyhow::Result<Self> {
+        let definitions = server
+            .get_tool_defs(None)
+            .await
+            .context("load native Qwen tool definitions")?
+            .into_iter()
+            .map(|definition| {
+                anyhow::ensure!(
+                    definition.parameters.is_object(),
+                    "tool {} parameters must be a JSON Schema object",
+                    definition.name
+                );
+                Ok(ToolDefinition::Function {
+                    function: FunctionDefinition {
+                        name: definition.name,
+                        description: definition.description,
+                        parameters: definition.parameters,
+                    },
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            server,
+            native_mcp,
+            definitions,
+            call_timeout: timeout_duration(config.tool_timeout_s),
+            max_calls: config.max_tool_calls,
+            max_iterations: config.max_tool_iterations,
+            effects_observed: Arc::new(AtomicBool::new(false)),
+            generic_calls: Arc::new(GenericToolState::default()),
+        })
+    }
+
+    fn start_generic_call(
+        server: ToolServerHandle,
+        state: Arc<GenericToolState>,
+        name: String,
+        arguments: String,
+    ) -> GenericToolCall {
+        state.active_calls.fetch_add(1, Ordering::SeqCst);
+        let call_state = state.clone();
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let worker_cancel_rx = cancel_rx.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _active = ActiveGenericToolCall(state);
+            let mut worker = tokio::spawn(crate::shell::with_tool_cancellation(
+                worker_cancel_rx,
+                async move {
+                    server
+                        .call_tool(&name, &arguments)
+                        .await
+                        .map_err(|err| err.to_string())
+                },
+            ));
+            let result = tokio::select! {
+                biased;
+                changed = cancel_rx.changed() => {
+                    if changed.is_err() || *cancel_rx.borrow() {
+                        match timeout(GENERIC_TOOL_COOPERATIVE_CANCEL_GRACE, &mut worker).await {
+                            Ok(_) => GenericToolResult::Cancelled,
+                            Err(_) => {
+                                worker.abort();
+                                let _ = timeout(GENERIC_TOOL_CLEANUP_TIMEOUT, &mut worker).await;
+                                GenericToolResult::Cancelled
+                            }
+                        }
+                    } else {
+                        match worker.await {
+                            Ok(result) => GenericToolResult::Completed(result),
+                            Err(err) => GenericToolResult::Completed(Err(format!(
+                                "generic tool task failed: {err}"
+                            ))),
+                        }
+                    }
+                }
+                result = &mut worker => match result {
+                    Ok(result) => GenericToolResult::Completed(result),
+                    Err(err) => GenericToolResult::Completed(Err(format!(
+                        "generic tool task failed: {err}"
+                    ))),
+                },
+            };
+            let _ = result_tx.send(result);
+        });
+        GenericToolCall {
+            cancel_tx: Some(cancel_tx),
+            result_rx,
+            state: call_state,
+        }
+    }
+
+    fn execute(&self, call_id: CallId, name: String, arguments: String) -> ToolFuture {
+        let server = self.server.clone();
+        let native_mcp = self.native_mcp.clone();
+        let call_timeout = self.call_timeout;
+        let effects_observed = self.effects_observed.clone();
+        let generic_calls = self.generic_calls.clone();
+        // Start generic work eagerly when the protocol has already supplied a valid object.
+        // Otherwise a fully buffered websocket can repeatedly win the session select before
+        // the boxed tool future gets its first poll, starving both execution and cancellation.
+        let generic_call = if matches!(
+            serde_json::from_str::<Value>(&arguments),
+            Ok(Value::Object(_))
+        ) && native_mcp
+            .as_ref()
+            .is_none_or(|native_mcp| !native_mcp.has_tool(&name))
+        {
+            effects_observed.store(true, Ordering::SeqCst);
+            Some(Self::start_generic_call(
+                server,
+                generic_calls,
+                name.clone(),
+                arguments.clone(),
+            ))
+        } else {
+            None
+        };
+        async move {
+            let output = match serde_json::from_str::<Value>(&arguments) {
+                Ok(Value::Object(_)) => {
+                    // A started MCP request may have applied side effects even when its reply is
+                    // lost or times out, so transparent websocket reconnect is unsafe afterward.
+                    effects_observed.store(true, Ordering::SeqCst);
+                    let result = if let Some(native_mcp) =
+                        native_mcp.filter(|native_mcp| native_mcp.has_tool(&name))
+                    {
+                        match native_mcp.call(&name, &arguments, call_timeout).await {
+                            Ok(result) => Ok(result),
+                            Err(NativeMcpCallError::Timeout) => {
+                                return ToolExecution {
+                                    call_id,
+                                    output: structured_tool_error(
+                                        "timeout",
+                                        "tool call deadline exceeded and MCP request was cancelled",
+                                    ),
+                                };
+                            }
+                            Err(NativeMcpCallError::FailClosed) => {
+                                return ToolExecution {
+                                    call_id,
+                                    output: structured_tool_error(
+                                        "mcp_fail_closed",
+                                        "MCP execution disabled after an ambiguous in-flight call",
+                                    ),
+                                };
+                            }
+                            Err(err) => Err(anyhow::anyhow!(err)),
+                        }
+                    } else {
+                        match generic_call {
+                            Some(call) => call.wait(call_timeout).await,
+                            None => Err(anyhow::anyhow!("generic tool call was not initialized")),
+                        }
+                    };
+                    match result {
+                        Ok(result) if result.len() <= MAX_TOOL_OUTPUT_BYTES => {
+                            structured_tool_success(&result)
+                        }
+                        Ok(_) => structured_tool_error(
+                            "result_too_large",
+                            "tool result exceeded the safety limit",
+                        ),
+                        Err(err) => structured_tool_error("tool_error", &err.to_string()),
+                    }
+                }
+                Ok(_) => {
+                    structured_tool_error("invalid_arguments", "arguments must be a JSON object")
+                }
+                Err(_) => {
+                    structured_tool_error("invalid_arguments", "arguments are not valid JSON")
+                }
+            };
+            ToolExecution { call_id, output }
+        }
+        .boxed()
+    }
+
+    fn effects_observed(&self) -> bool {
+        self.effects_observed.load(Ordering::SeqCst)
+    }
+
+    fn generic_fail_closed(&self) -> bool {
+        self.generic_calls.fail_closed.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_tool_idle(&self) -> anyhow::Result<()> {
+        let generic_idle = async {
+            loop {
+                let notified = self.generic_calls.idle.notified();
+                if self.generic_calls.active_calls.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        };
+        anyhow::ensure!(
+            timeout(GENERIC_TOOL_CLEANUP_TIMEOUT, generic_idle)
+                .await
+                .is_ok(),
+            "timed out cancelling an in-flight generic tool"
+        );
+        if let Some(native_mcp) = &self.native_mcp {
+            anyhow::ensure!(
+                native_mcp.wait_for_idle(NATIVE_MCP_CLEANUP_TIMEOUT).await,
+                "timed out cancelling the in-flight native MCP request"
+            );
+        }
+        Ok(())
+    }
+}
+
+fn transparent_reconnect_allowed(tools: &NativeToolRuntime) -> bool {
+    !tools.effects_observed()
+}
+
+#[derive(Debug)]
+struct PendingFunctionCall {
+    item_id: String,
+    output_index: u32,
+    name: String,
+    arguments: String,
+}
+
+struct ToolExecution {
+    call_id: CallId,
+    output: String,
+}
+
+type ToolFuture = BoxFuture<'static, ToolExecution>;
+
+fn structured_tool_success(raw: &str) -> String {
+    let result = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()));
+    json!({"ok": true, "result": result}).to_string()
+}
+
+fn structured_tool_error(kind: &str, message: &str) -> String {
+    json!({
+        "ok": false,
+        "error": {
+            "kind": kind,
+            "message": message.chars().take(256).collect::<String>(),
+        }
+    })
+    .to_string()
+}
+
 enum Cancellable<T> {
     Completed(T),
     Cancelled,
@@ -877,9 +1252,60 @@ where
 async fn run_realtime_session(
     config: QwenRealtimeConfig,
     capture: CaptureConfig,
+    tools: NativeToolRuntime,
     idle_timeout: Duration,
     mut cancel_rx: watch::Receiver<bool>,
     setup_phase: Arc<StdMutex<SetupPhase>>,
+) -> anyhow::Result<()> {
+    let mut connector = ProductionSessionConnector {
+        config,
+        capture,
+        tools: tools.clone(),
+        idle_timeout,
+        setup_phase,
+    };
+    run_realtime_session_loop(&tools, &mut cancel_rx, &mut connector).await
+}
+
+trait RealtimeSessionConnector {
+    fn run_connected<'a>(
+        &'a mut self,
+        cancel_rx: &'a mut watch::Receiver<bool>,
+        machine: &'a mut SessionMachine,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
+}
+
+struct ProductionSessionConnector {
+    config: QwenRealtimeConfig,
+    capture: CaptureConfig,
+    tools: NativeToolRuntime,
+    idle_timeout: Duration,
+    setup_phase: Arc<StdMutex<SetupPhase>>,
+}
+
+impl RealtimeSessionConnector for ProductionSessionConnector {
+    fn run_connected<'a>(
+        &'a mut self,
+        cancel_rx: &'a mut watch::Receiver<bool>,
+        machine: &'a mut SessionMachine,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        run_connected_session(
+            &self.config,
+            &self.capture,
+            &self.tools,
+            self.idle_timeout,
+            cancel_rx,
+            &self.setup_phase,
+            machine,
+        )
+        .boxed()
+    }
+}
+
+async fn run_realtime_session_loop<C: RealtimeSessionConnector>(
+    tools: &NativeToolRuntime,
+    cancel_rx: &mut watch::Receiver<bool>,
+    connector: &mut C,
 ) -> anyhow::Result<()> {
     let mut machine = SessionMachine::new();
     machine.transition(SessionState::Connecting)?;
@@ -890,19 +1316,16 @@ async fn run_realtime_session(
             machine.transition(SessionState::Closed)?;
             return Ok(());
         }
-        match run_connected_session(
-            &config,
-            &capture,
-            idle_timeout,
-            &mut cancel_rx,
-            &setup_phase,
-            &mut machine,
-        )
-        .await
-        {
+        match connector.run_connected(cancel_rx, &mut machine).await {
             Ok(()) => return Ok(()),
             Err(err) => {
                 warn!(attempt, "Qwen realtime session failed: {err:#}");
+                if !transparent_reconnect_allowed(tools) {
+                    machine.transition(SessionState::Failed).ok();
+                    return Err(err.context(
+                        "transparent reconnect disabled after a native tool request started",
+                    ));
+                }
                 last_error = Some(err);
                 if matches!(
                     machine.state(),
@@ -924,6 +1347,7 @@ async fn run_realtime_session(
 async fn run_connected_session(
     config: &QwenRealtimeConfig,
     capture: &CaptureConfig,
+    tools: &NativeToolRuntime,
     idle_timeout: Duration,
     cancel_rx: &mut watch::Receiver<bool>,
     setup_phase: &Arc<StdMutex<SetupPhase>>,
@@ -949,8 +1373,8 @@ async fn run_connected_session(
                 voice: config.voice.clone(),
                 input_audio_format: AudioFormat::Pcm,
                 output_audio_format: AudioFormat::Pcm,
-                instructions: None,
-                tools: Vec::new(),
+                instructions: Some(SPEAKER_AGENT_INSTRUCTIONS.to_string()),
+                tools: tools.definitions.clone(),
             },
         },
         event_timeout,
@@ -1047,8 +1471,57 @@ async fn run_connected_session(
         &mut audio_rx,
         &mut capture_task,
         (cancel_rx, event_timeout, machine),
+        Some(tools.clone()),
     )
     .await
+}
+
+async fn send_tool_execution<S, E>(
+    sink: &mut S,
+    execution: ToolExecution,
+    event_timeout: Duration,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Cancellable<()>>
+where
+    S: futures::Sink<Message, Error = E> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    send_event_cancellable(
+        sink,
+        &ClientEvent::ConversationItemCreate {
+            event_id: None,
+            item: ConversationItem::FunctionCallOutput {
+                call_id: execution.call_id,
+                output: FunctionCallOutput(execution.output),
+            },
+        },
+        event_timeout,
+        cancel_rx,
+    )
+    .await
+    .context("send Qwen function_call_output")
+}
+
+async fn continue_after_tools<S, E>(
+    sink: &mut S,
+    event_timeout: Duration,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> anyhow::Result<Cancellable<()>>
+where
+    S: futures::Sink<Message, Error = E> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    send_event_cancellable(
+        sink,
+        &ClientEvent::ResponseCreate {
+            event_id: None,
+            response: None,
+        },
+        event_timeout,
+        cancel_rx,
+    )
+    .await
+    .context("continue Qwen response after tools")
 }
 
 async fn run_connected_resources_with_timeout<S, St, SinkError, StreamError, P, CaptureOutput>(
@@ -1058,6 +1531,7 @@ async fn run_connected_resources_with_timeout<S, St, SinkError, StreamError, P, 
     audio_rx: &mut mpsc::Receiver<UploadCommand>,
     capture_task: &mut AbortOnDropTask<anyhow::Result<CaptureOutput>>,
     control: (&mut watch::Receiver<bool>, Duration, &mut SessionMachine),
+    tools: Option<NativeToolRuntime>,
 ) -> anyhow::Result<()>
 where
     S: futures::Sink<Message, Error = SinkError> + Unpin,
@@ -1068,8 +1542,18 @@ where
 {
     let (cancel_rx, event_timeout, machine) = control;
     let mut active_response: Option<ResponseId> = None;
+    let mut response_deadline: Option<Instant> = None;
     let mut capture_done = false;
     let mut cancel_observed = *cancel_rx.borrow();
+    let mut response_calls = HashMap::<CallId, PendingFunctionCall>::new();
+    // A call ID is single-use for the whole connected turn, not merely within one
+    // response iteration. The call-count limit also bounds this ledger.
+    let mut seen_call_ids = HashSet::<CallId>::new();
+    let mut pending_tools = FuturesUnordered::<ToolFuture>::new();
+    let mut deferred_message: Option<Message> = None;
+    let mut waiting_for_tools = false;
+    let mut tool_iterations = 0usize;
+    let mut tool_calls = 0usize;
 
     let session_result: anyhow::Result<()> = async {
         loop {
@@ -1077,6 +1561,7 @@ where
                 cancel_observed = true;
                 break;
             }
+            let tools_pending = !pending_tools.is_empty();
             tokio::select! {
                 biased;
                 changed = cancel_rx.changed() => {
@@ -1084,6 +1569,14 @@ where
                         cancel_observed = true;
                         break;
                     }
+                }
+                _ = async {
+                    match response_deadline {
+                        Some(deadline) => sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    anyhow::bail!("timed out waiting for the next Qwen response event");
                 }
                 Some(upload) = audio_rx.recv() => {
                     let send_result = match upload {
@@ -1121,6 +1614,7 @@ where
                                 ).await.context("create Qwen response")?;
                                 if matches!(created, Cancellable::Completed(())) {
                                     machine.transition(SessionState::Responding)?;
+                                    response_deadline = Some(Instant::now() + event_timeout);
                                 }
                                 created
                             }
@@ -1135,15 +1629,92 @@ where
                     capture_done = true;
                     captured.context("Qwen capture task panicked")??;
                 }
-                message = stream.next() => {
-                    let message = message.context("Qwen websocket closed")??;
+                Some(execution) = pending_tools.next(), if tools_pending => {
+                    if tools
+                        .as_ref()
+                        .is_some_and(NativeToolRuntime::generic_fail_closed)
+                    {
+                        anyhow::bail!(
+                            "generic tool outcome was ambiguous; turn failed closed after cleanup"
+                        );
+                    }
+                    if matches!(
+                        send_tool_execution(sink, execution, event_timeout, cancel_rx).await?,
+                        Cancellable::Cancelled
+                    ) {
+                        cancel_observed = true;
+                        break;
+                    }
+                    if waiting_for_tools && pending_tools.is_empty() {
+                        let tool_runtime = tools
+                            .as_ref()
+                            .context("Qwen requested tools without a tool runtime")?;
+                        anyhow::ensure!(
+                            tool_iterations <= tool_runtime.max_iterations,
+                            "native Qwen tool iteration limit reached"
+                        );
+                        if matches!(
+                            continue_after_tools(sink, event_timeout, cancel_rx).await?,
+                            Cancellable::Cancelled
+                        ) {
+                            cancel_observed = true;
+                            break;
+                        }
+                        waiting_for_tools = false;
+                        active_response = None;
+                        response_deadline = Some(Instant::now() + event_timeout);
+                    }
+                }
+                message = async {
+                    if deferred_message.is_some() {
+                        if !tools_pending {
+                            deferred_message
+                                .take()
+                                .ok_or_else(|| anyhow::anyhow!("deferred message disappeared"))
+                        } else {
+                            std::future::pending::<anyhow::Result<Message>>().await
+                        }
+                    } else {
+                        stream
+                            .next()
+                            .await
+                            .context("Qwen websocket closed")?
+                            .map_err(anyhow::Error::new)
+                    }
+                } => {
+                    let message = message?;
                     if message.is_close() {
                         anyhow::bail!("Qwen websocket closed");
                     }
-                    let Message::Text(text) = message else { continue; };
-                    match serde_json::from_str::<ServerEvent>(&text).context("decode Qwen server event")? {
+                    let Message::Text(text) = &message else { continue; };
+                    let event = serde_json::from_str::<ServerEvent>(text)
+                        .context("decode Qwen server event")?;
+                    let defer_until_tools_finish = !pending_tools.is_empty()
+                        && match &event {
+                            ServerEvent::ResponseAudioDelta(delta) => active_response
+                                .as_ref()
+                                .is_some_and(|response| response != &delta.response_id),
+                            ServerEvent::ResponseAudioTranscriptDone(done) => active_response
+                                .as_ref()
+                                .is_some_and(|response| response != &done.response_id),
+                            ServerEvent::Error(_) => false,
+                            _ => true,
+                        };
+                    if defer_until_tools_finish {
+                        deferred_message = Some(message);
+                        continue;
+                    }
+                    match event {
                         ServerEvent::ResponseAudioDelta(delta) => {
+                            if active_response
+                                .as_ref()
+                                .is_some_and(|response| response != &delta.response_id)
+                            {
+                                warn!("ignoring stale Qwen audio delta");
+                                continue;
+                            }
                             active_response = Some(delta.response_id);
+                            response_deadline = Some(Instant::now() + event_timeout);
                             let pcm = base64::engine::general_purpose::STANDARD
                                 .decode(delta.delta.0)
                                 .context("decode Qwen audio delta")?;
@@ -1154,11 +1725,156 @@ where
                                 Err(QueueError::Closed) => anyhow::bail!("realtime playback task stopped"),
                             }
                         }
+                        ServerEvent::ResponseAudioTranscriptDone(done) => {
+                            anyhow::ensure!(
+                                active_response
+                                    .as_ref()
+                                    .is_none_or(|response| response == &done.response_id),
+                                "audio transcript belongs to a conflicting response"
+                            );
+                            active_response = Some(done.response_id);
+                            response_deadline = Some(Instant::now() + event_timeout);
+                            debug!(characters = done.transcript.chars().count(), "Qwen transcript completed");
+                        }
+                        ServerEvent::ResponseFunctionCallArgumentsDone(call) => {
+                            let tool_runtime = tools
+                                .as_ref()
+                                .context("Qwen requested tools without a tool runtime")?;
+                            anyhow::ensure!(
+                                !waiting_for_tools && pending_tools.is_empty(),
+                                "received a function call while prior tools were still running"
+                            );
+                            anyhow::ensure!(
+                                active_response
+                                    .as_ref()
+                                    .is_none_or(|response| response == &call.response_id),
+                                "function call belongs to a conflicting response"
+                            );
+                            anyhow::ensure!(
+                                tool_iterations < tool_runtime.max_iterations,
+                                "native Qwen tool iteration limit reached"
+                            );
+                            anyhow::ensure!(
+                                !seen_call_ids.contains(&call.call_id),
+                                "replayed Qwen function call ID"
+                            );
+                            anyhow::ensure!(
+                                tool_calls + response_calls.len() < tool_runtime.max_calls,
+                                "native Qwen tool call limit reached"
+                            );
+                            anyhow::ensure!(
+                                !call.call_id.0.is_empty()
+                                    && call.call_id.0.len() <= MAX_CALL_ID_BYTES,
+                                "invalid Qwen function call ID"
+                            );
+                            anyhow::ensure!(
+                                !call.name.is_empty() && call.name.len() <= MAX_TOOL_NAME_BYTES,
+                                "invalid Qwen function name"
+                            );
+                            anyhow::ensure!(
+                                call.arguments.0.len() <= MAX_TOOL_ARGUMENT_BYTES,
+                                "Qwen function arguments exceed the safety limit"
+                            );
+                            anyhow::ensure!(
+                                !response_calls.contains_key(&call.call_id),
+                                "duplicate Qwen function call ID"
+                            );
+                            anyhow::ensure!(
+                                !response_calls.values().any(|prior| {
+                                    prior.item_id == call.item_id.0
+                                        || prior.output_index == call.output_index
+                                }),
+                                "duplicate Qwen function call item or output index"
+                            );
+                            active_response = Some(call.response_id);
+                            response_deadline = Some(Instant::now() + event_timeout);
+                            seen_call_ids.insert(call.call_id.clone());
+                            response_calls.insert(
+                                call.call_id,
+                                PendingFunctionCall {
+                                    item_id: call.item_id.0,
+                                    output_index: call.output_index,
+                                    name: call.name,
+                                    arguments: call.arguments.0,
+                                },
+                            );
+                        }
                         ServerEvent::ResponseDone(done) => {
                             debug!(status = ?done.response.status, "Qwen response completed");
-                            machine.transition(SessionState::Ready)?;
-                            machine.transition(SessionState::ShuttingDown)?;
-                            break;
+                            anyhow::ensure!(
+                                done.response.status == ResponseStatus::Completed,
+                                "Qwen response ended with status {:?}",
+                                done.response.status
+                            );
+                            anyhow::ensure!(
+                                active_response
+                                    .as_ref()
+                                    .is_none_or(|response| response == &done.response.id),
+                                "response.done belongs to a conflicting response"
+                            );
+                            let done_calls = done
+                                .response
+                                .output
+                                .iter()
+                                .filter_map(|item| match item {
+                                    ResponseOutputItem::FunctionCall {
+                                        id,
+                                        status,
+                                        call_id,
+                                        name,
+                                        arguments,
+                                    } => Some((id, status, call_id, name, arguments)),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
+                            if !done_calls.is_empty() {
+                                let tool_runtime = tools
+                                    .as_ref()
+                                    .context("Qwen requested tools without a tool runtime")?;
+                                anyhow::ensure!(
+                                    done_calls.len() <= tool_runtime.max_calls
+                                        && done_calls.len() == response_calls.len(),
+                                    "response.done function calls do not match arguments events"
+                                );
+                                let mut done_ids = HashSet::with_capacity(done_calls.len());
+                                for (id, status, call_id, name, arguments) in done_calls {
+                                    anyhow::ensure!(
+                                        *status == ResponseStatus::Completed
+                                            && done_ids.insert(call_id.clone()),
+                                        "duplicate or incomplete response.done function call"
+                                    );
+                                    let received = response_calls.get(call_id).context(
+                                        "response.done function call is missing its arguments event",
+                                    )?;
+                                    anyhow::ensure!(
+                                        received.item_id == id.0
+                                            && received.name == *name
+                                            && received.arguments == arguments.0,
+                                        "conflicting function call data across Qwen response events"
+                                    );
+                                }
+                                tool_iterations += 1;
+                                tool_calls += response_calls.len();
+                                waiting_for_tools = true;
+                                response_deadline = None;
+                                for (call_id, call) in response_calls.drain() {
+                                    pending_tools.push(tool_runtime.execute(
+                                        call_id,
+                                        call.name,
+                                        call.arguments,
+                                    ));
+                                }
+
+                            } else {
+                                anyhow::ensure!(
+                                    response_calls.is_empty(),
+                                    "response.done omitted a received function call"
+                                );
+                                response_deadline = None;
+                                machine.transition(SessionState::Ready)?;
+                                machine.transition(SessionState::ShuttingDown)?;
+                                break;
+                            }
                         }
                         ServerEvent::Error(error) => anyhow::bail!("Qwen realtime error: {}", error.error.message),
                         _ => {}
@@ -1183,7 +1899,17 @@ where
             cancel_result?;
         }
         Ok(())
-    }.await;
+    }
+    .await;
+
+    // Dropping the tool futures signals cancellation to the managed RMCP workers.
+    // Wait for those workers to send notifications/cull correlation state before
+    // websocket teardown can finish or a replacement turn can start.
+    drop(pending_tools);
+    let mcp_cleanup_result = match &tools {
+        Some(tools) => tools.wait_for_tool_idle().await,
+        None => Ok(()),
+    };
 
     let capture_result = if !capture_done {
         capture_task.abort();
@@ -1220,7 +1946,8 @@ where
     let teardown_result = capture_result
         .and(recorder_result)
         .and(close_result)
-        .and(player_result);
+        .and(player_result)
+        .and(mcp_cleanup_result);
     if matches!(machine.state(), SessionState::Cancelling) {
         machine.transition(SessionState::ShuttingDown).ok();
     }
@@ -1254,6 +1981,38 @@ where
         audio_rx,
         capture_task,
         (cancel_rx, Duration::from_secs(1), machine),
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_connected_resources_with_tools<S, St, SinkError, StreamError, P, CaptureOutput>(
+    sink: &mut S,
+    stream: &mut St,
+    player: P,
+    audio_rx: &mut mpsc::Receiver<UploadCommand>,
+    capture_task: &mut AbortOnDropTask<anyhow::Result<CaptureOutput>>,
+    cancel_rx: &mut watch::Receiver<bool>,
+    machine: &mut SessionMachine,
+    tools: NativeToolRuntime,
+) -> anyhow::Result<()>
+where
+    S: futures::Sink<Message, Error = SinkError> + Unpin,
+    St: futures::Stream<Item = Result<Message, StreamError>> + Unpin,
+    SinkError: std::error::Error + Send + Sync + 'static,
+    StreamError: std::error::Error + Send + Sync + 'static,
+    P: SessionPlayer,
+{
+    run_connected_resources_with_timeout(
+        sink,
+        stream,
+        player,
+        audio_rx,
+        capture_task,
+        (cancel_rx, Duration::from_secs(1), machine),
+        Some(tools),
     )
     .await
 }
@@ -1288,9 +2047,348 @@ fn validate_s16le_frame(bytes: &[u8], label: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures::task::{Context as TaskContext, Poll};
+    use rig_core::completion::ToolDefinition as RigToolDefinition;
+    use rig_core::tool::Tool;
+    use rmcp::model::{
+        CallToolRequestParams, CallToolResult, ClientInfo, ErrorData, Implementation,
+        ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+        Tool as RmcpTool,
+    };
+    use rmcp::service::RequestContext;
+    use rmcp::{RoleServer, ServerHandler, ServiceExt};
+    use serde::Deserialize;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    #[derive(Clone)]
+    struct MockMcpTool {
+        fail: bool,
+        pending: Option<Arc<tokio::sync::Notify>>,
+        calls: Option<Arc<AtomicU64>>,
+    }
+
+    #[derive(Deserialize)]
+    struct MockMcpArgs {
+        entity_id: String,
+    }
+
+    impl Tool for MockMcpTool {
+        const NAME: &'static str = "ha_turn_on";
+        type Error = std::io::Error;
+        type Args = MockMcpArgs;
+        type Output = String;
+
+        async fn definition(&self, _: String) -> RigToolDefinition {
+            RigToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "Turn on one Home Assistant entity".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "entity_id": {"type": "string", "pattern": "^[a-z_]+\\.[a-z0-9_]+$"}
+                    },
+                    "required": ["entity_id"],
+                    "additionalProperties": false
+                }),
+            }
+        }
+
+        async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+            if let Some(calls) = &self.calls {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some(started) = &self.pending {
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            if self.fail {
+                return Err(std::io::Error::other("mock MCP failure"));
+            }
+            Ok(json!({"entity_id": args.entity_id, "changed": true}).to_string())
+        }
+    }
+
+    #[derive(Clone)]
+    struct SideEffectShellTool {
+        script: String,
+    }
+
+    impl Tool for SideEffectShellTool {
+        const NAME: &'static str = "side_effect_shell";
+        type Error = std::io::Error;
+        type Args = serde_json::Map<String, Value>;
+        type Output = String;
+
+        async fn definition(&self, _: String) -> RigToolDefinition {
+            RigToolDefinition {
+                name: Self::NAME.to_string(),
+                description: "Run a deterministic side-effecting shell fixture".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+            }
+        }
+
+        async fn call(&self, _: Self::Args) -> Result<Self::Output, Self::Error> {
+            crate::shell::run_shell(&self.script)
+                .await
+                .map(|result| json!({"exit_code": result.exit_code}).to_string())
+                .map_err(std::io::Error::other)
+        }
+    }
+
+    fn side_effect_path(label: &str) -> std::path::PathBuf {
+        static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "xiaoai-qwen-{label}-{}-{}",
+            std::process::id(),
+            NEXT_PATH.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    fn side_effect_script(path: &std::path::Path) -> String {
+        let path_text = path.to_string_lossy();
+        let path = shell_words::quote(&path_text);
+        format!("printf 'run\\n' >> {path}; sleep 1; printf 'late\\n' >> {path}")
+    }
+
+    #[derive(Clone)]
+    struct CancellableRmcpServer {
+        started: Arc<tokio::sync::Notify>,
+        stopped: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicU64>,
+        in_flight: Arc<AtomicU64>,
+    }
+
+    struct InFlightRmcpCall {
+        in_flight: Arc<AtomicU64>,
+        stopped: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for InFlightRmcpCall {
+        fn drop(&mut self) {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.stopped.notify_waiters();
+        }
+    }
+
+    impl ServerHandler for CancellableRmcpServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                .with_protocol_version(ProtocolVersion::LATEST)
+                .with_server_info(Implementation::new("cancellable-server", "0.1.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(vec![RmcpTool::new(
+                "hang_forever".to_string(),
+                "Wait for MCP cancellation".to_string(),
+                Arc::new(serde_json::Map::new()),
+            )]))
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, ErrorData> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            let _in_flight = InFlightRmcpCall {
+                in_flight: self.in_flight.clone(),
+                stopped: self.stopped.clone(),
+            };
+            self.started.notify_waiters();
+            context.ct.cancelled().await;
+            Err(ErrorData::internal_error("cancelled", None))
+        }
+    }
+
+    #[derive(Clone)]
+    struct DynamicRoutingRmcpServer {
+        tools: Arc<tokio::sync::RwLock<Vec<RmcpTool>>>,
+        list_calls: Arc<AtomicU64>,
+        fail_list_from: Option<u64>,
+        hang_list_from: Option<u64>,
+        started: Arc<tokio::sync::Notify>,
+        stopped: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicU64>,
+        in_flight: Arc<AtomicU64>,
+    }
+
+    impl DynamicRoutingRmcpServer {
+        fn new(tools: Vec<RmcpTool>) -> Self {
+            Self {
+                tools: Arc::new(tokio::sync::RwLock::new(tools)),
+                list_calls: Arc::new(AtomicU64::new(0)),
+                fail_list_from: None,
+                hang_list_from: None,
+                started: Arc::new(tokio::sync::Notify::new()),
+                stopped: Arc::new(tokio::sync::Notify::new()),
+                calls: Arc::new(AtomicU64::new(0)),
+                in_flight: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        async fn set_tools(&self, tools: Vec<RmcpTool>) {
+            *self.tools.write().await = tools;
+        }
+
+        fn failing_after_initial_discovery(mut self) -> Self {
+            self.fail_list_from = Some(1);
+            self
+        }
+
+        fn failing_initial_discovery(mut self) -> Self {
+            self.fail_list_from = Some(0);
+            self
+        }
+
+        fn hanging_initial_discovery(mut self) -> Self {
+            self.hang_list_from = Some(0);
+            self
+        }
+
+        fn hanging_after_initial_discovery(mut self) -> Self {
+            self.hang_list_from = Some(1);
+            self
+        }
+    }
+
+    impl ServerHandler for DynamicRoutingRmcpServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                .with_protocol_version(ProtocolVersion::LATEST)
+                .with_server_info(Implementation::new("dynamic-routing-server", "0.1.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            let prior_calls = self.list_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .hang_list_from
+                .is_some_and(|hang_from| prior_calls >= hang_from)
+            {
+                std::future::pending().await
+            }
+            if self
+                .fail_list_from
+                .is_some_and(|fail_from| prior_calls >= fail_from)
+            {
+                return Err(ErrorData::internal_error(
+                    "configured routing discovery failure",
+                    None,
+                ));
+            }
+            Ok(ListToolsResult::with_all_items(
+                self.tools.read().await.clone(),
+            ))
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, ErrorData> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            let _in_flight = InFlightRmcpCall {
+                in_flight: self.in_flight.clone(),
+                stopped: self.stopped.clone(),
+            };
+            self.started.notify_waiters();
+            context.ct.cancelled().await;
+            Err(ErrorData::internal_error("cancelled", None))
+        }
+    }
+
+    fn routing_test_tool(name: &str) -> RmcpTool {
+        RmcpTool::new(
+            name.to_string(),
+            "Wait for managed native cancellation".to_string(),
+            Arc::new(serde_json::Map::new()),
+        )
+    }
+
+    #[derive(Clone)]
+    struct NonCooperativeRmcpServer {
+        started: Arc<tokio::sync::Notify>,
+        stopped: Arc<tokio::sync::Notify>,
+        calls: Arc<AtomicU64>,
+        in_flight: Arc<AtomicU64>,
+        transport_closed: Arc<AtomicBool>,
+    }
+
+    struct EofObservedReader<R> {
+        inner: R,
+        transport_closed: Arc<AtomicBool>,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for EofObservedReader<R> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let filled_before = buffer.filled().len();
+            let result = Pin::new(&mut self.inner).poll_read(context, buffer);
+            if matches!(result, Poll::Ready(Ok(()))) && buffer.filled().len() == filled_before {
+                self.transport_closed.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+    }
+
+    impl ServerHandler for NonCooperativeRmcpServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+                .with_protocol_version(ProtocolVersion::LATEST)
+                .with_server_info(Implementation::new("non-cooperative-server", "0.1.0"))
+        }
+
+        async fn list_tools(
+            &self,
+            _request: Option<PaginatedRequestParams>,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<ListToolsResult, ErrorData> {
+            Ok(ListToolsResult::with_all_items(vec![RmcpTool::new(
+                "hang_forever".to_string(),
+                "Ignore protocol cancellation and never reply".to_string(),
+                Arc::new(serde_json::Map::new()),
+            )]))
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, ErrorData> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.in_flight.fetch_add(1, Ordering::SeqCst);
+            let _in_flight = InFlightRmcpCall {
+                in_flight: self.in_flight.clone(),
+                stopped: self.stopped.clone(),
+            };
+            self.started.notify_waiters();
+            let _ = &context;
+            while !self.transport_closed.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(ErrorData::internal_error("transport closed", None))
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct MockWsError(&'static str);
@@ -1482,9 +2580,21 @@ mod tests {
     }
 
     fn audio_delta() -> Message {
+        audio_delta_for("r")
+    }
+
+    fn audio_delta_for(response_id: &str) -> Message {
         Message::Text(
-            r#"{"type":"response.audio.delta","response_id":"r","item_id":"i","output_index":0,"content_index":0,"delta":"AAE="}"#
-                .into(),
+            json!({
+                "type": "response.audio.delta",
+                "response_id": response_id,
+                "item_id": "i",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "AAE="
+            })
+            .to_string()
+            .into(),
         )
     }
 
@@ -1493,6 +2603,83 @@ mod tests {
             format!(
                 r#"{{"type":"response.audio.delta","response_id":"r","item_id":"i","output_index":0,"content_index":0,"delta":"{delta}"}}"#
             )
+            .into(),
+        )
+    }
+
+    fn function_call(call_id: &str) -> Message {
+        function_call_with(
+            call_id,
+            "tool-response",
+            "tool-item",
+            0,
+            "ha_turn_on",
+            "{\"entity_id\":\"light.kitchen\"}",
+        )
+    }
+
+    fn function_call_with(
+        call_id: &str,
+        response_id: &str,
+        item_id: &str,
+        output_index: u32,
+        name: &str,
+        arguments: &str,
+    ) -> Message {
+        Message::Text(
+            json!({
+                "type": "response.function_call_arguments.done",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments
+            })
+            .to_string()
+            .into(),
+        )
+    }
+
+    fn tool_response_done() -> Message {
+        tool_response_done_with(
+            "call-1",
+            "tool-response",
+            "tool-item",
+            "ha_turn_on",
+            "{\"entity_id\":\"light.kitchen\"}",
+        )
+    }
+
+    fn tool_response_done_with(
+        call_id: &str,
+        response_id: &str,
+        item_id: &str,
+        name: &str,
+        arguments: &str,
+    ) -> Message {
+        Message::Text(
+            json!({
+                "type": "response.done",
+                "response": {
+                    "id": response_id,
+                    "object": "realtime.response",
+                    "conversation_id": "conversation",
+                    "status": "completed",
+                    "modalities": ["text", "audio"],
+                    "voice": "Cherry",
+                    "output_audio_format": "pcm",
+                    "output": [{
+                        "type": "function_call",
+                        "id": item_id,
+                        "status": "completed",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": arguments
+                    }]
+                }
+            })
+            .to_string()
             .into(),
         )
     }
@@ -1547,6 +2734,133 @@ mod tests {
         )
         .await;
         (result, sink_state, player_state, capture_dropped)
+    }
+
+    async fn run_tool_messages(
+        messages: Vec<Message>,
+        tools: NativeToolRuntime,
+        event_timeout: Duration,
+    ) -> (
+        anyhow::Result<()>,
+        Arc<StdMutex<MockSinkState>>,
+        Arc<MockPlayerState>,
+        Arc<AtomicBool>,
+    ) {
+        let stream = futures::stream::iter(messages.into_iter().map(Ok::<_, MockWsError>))
+            .chain(futures::stream::pending());
+        run_tool_stream(stream, tools, event_timeout).await
+    }
+
+    async fn run_tool_stream<St>(
+        stream: St,
+        tools: NativeToolRuntime,
+        event_timeout: Duration,
+    ) -> (
+        anyhow::Result<()>,
+        Arc<StdMutex<MockSinkState>>,
+        Arc<MockPlayerState>,
+        Arc<AtomicBool>,
+    )
+    where
+        St: futures::Stream<Item = Result<Message, MockWsError>> + Unpin,
+    {
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        run_tool_stream_with_cancel(stream, tools, event_timeout, cancel_rx).await
+    }
+
+    async fn run_tool_stream_with_cancel<St>(
+        mut stream: St,
+        tools: NativeToolRuntime,
+        event_timeout: Duration,
+        mut cancel_rx: watch::Receiver<bool>,
+    ) -> (
+        anyhow::Result<()>,
+        Arc<StdMutex<MockSinkState>>,
+        Arc<MockPlayerState>,
+        Arc<AtomicBool>,
+    )
+    where
+        St: futures::Stream<Item = Result<Message, MockWsError>> + Unpin,
+    {
+        let sink_state = Arc::new(StdMutex::new(MockSinkState::default()));
+        let mut sink = MockSink {
+            state: sink_state.clone(),
+        };
+        let player_state = Arc::new(MockPlayerState::default());
+        let player = MockPlayer {
+            state: player_state.clone(),
+            playback: MockPlayback::Accept,
+            shutdown_gate: None,
+        };
+        let (audio_tx, mut audio_rx) = mpsc::channel(1);
+        let _keep_audio_open = audio_tx;
+        let capture_dropped = Arc::new(AtomicBool::new(false));
+        let mut capture = pending_capture(capture_dropped.clone());
+        let mut machine = capturing_machine();
+        machine.transition(SessionState::Responding).unwrap();
+        let result = run_connected_resources_with_timeout(
+            &mut sink,
+            &mut stream,
+            player,
+            &mut audio_rx,
+            &mut capture,
+            (&mut cancel_rx, event_timeout, &mut machine),
+            Some(tools),
+        )
+        .await;
+        (result, sink_state, player_state, capture_dropped)
+    }
+
+    struct MockRealtimeConnector {
+        plans: VecDeque<Vec<Message>>,
+        tools: NativeToolRuntime,
+        attempts: usize,
+        sinks: Vec<Arc<StdMutex<MockSinkState>>>,
+    }
+
+    impl RealtimeSessionConnector for MockRealtimeConnector {
+        fn run_connected<'a>(
+            &'a mut self,
+            cancel_rx: &'a mut watch::Receiver<bool>,
+            machine: &'a mut SessionMachine,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            self.attempts += 1;
+            let messages = self
+                .plans
+                .pop_front()
+                .expect("unexpected reconnect attempt");
+            let tools = self.tools.clone();
+            let sink_state = Arc::new(StdMutex::new(MockSinkState::default()));
+            self.sinks.push(sink_state.clone());
+            async move {
+                machine.transition(SessionState::Ready)?;
+                machine.transition(SessionState::Capturing)?;
+                machine.transition(SessionState::Responding)?;
+                let mut sink = MockSink { state: sink_state };
+                let mut stream =
+                    futures::stream::iter(messages.into_iter().map(Ok::<_, MockWsError>))
+                        .chain(futures::stream::pending());
+                let player = MockPlayer {
+                    state: Arc::new(MockPlayerState::default()),
+                    playback: MockPlayback::Accept,
+                    shutdown_gate: None,
+                };
+                let (audio_tx, mut audio_rx) = mpsc::channel(1);
+                let _keep_audio_open = audio_tx;
+                let mut capture = pending_capture(Arc::new(AtomicBool::new(false)));
+                run_connected_resources_with_timeout(
+                    &mut sink,
+                    &mut stream,
+                    player,
+                    &mut audio_rx,
+                    &mut capture,
+                    (cancel_rx, Duration::from_millis(100), machine),
+                    Some(tools),
+                )
+                .await
+            }
+            .boxed()
+        }
     }
 
     fn assert_full_teardown(
@@ -1611,6 +2925,1325 @@ mod tests {
 
         assert_full_teardown(&sink_state, &player_state, &capture_dropped);
         assert_eq!(sink_state.lock().unwrap().sent.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn native_tool_loop_correlates_call_and_continues_to_final_audio() {
+        let tool_server = rig_core::tool::server::ToolServer::new()
+            .tool(MockMcpTool {
+                fail: false,
+                pending: None,
+                calls: None,
+            })
+            .run();
+        let config = QwenRealtimeConfig {
+            max_tool_iterations: 2,
+            max_tool_calls: 1,
+            ..QwenRealtimeConfig::default()
+        };
+        let tools = NativeToolRuntime::load(&config, tool_server).await.unwrap();
+        assert_eq!(tools.definitions.len(), 1);
+        let ToolDefinition::Function { function } = &tools.definitions[0];
+        assert_eq!(function.name, "ha_turn_on");
+        assert_eq!(function.parameters["additionalProperties"], false);
+
+        let sink_state = Arc::new(StdMutex::new(MockSinkState::default()));
+        let mut sink = MockSink {
+            state: sink_state.clone(),
+        };
+        let final_done =
+            Message::Text(include_str!("../tests/fixtures/qwen_server_response_done.json").into());
+        let mut stream = futures::stream::iter([
+            Ok::<Message, MockWsError>(function_call("call-1")),
+            Ok(tool_response_done()),
+            Ok(audio_delta_for("resp_HaVOPdbmX6vifiV5pAfJY")),
+            Ok(final_done),
+        ]);
+        let player_state = Arc::new(MockPlayerState::default());
+        let player = MockPlayer {
+            state: player_state.clone(),
+            playback: MockPlayback::Accept,
+            shutdown_gate: None,
+        };
+        let (audio_tx, mut audio_rx) = mpsc::channel(1);
+        audio_tx.send(UploadCommand::Commit).await.unwrap();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let capture_dropped = Arc::new(AtomicBool::new(false));
+        let mut capture = pending_capture(capture_dropped.clone());
+        let mut machine = capturing_machine();
+
+        run_connected_resources_with_tools(
+            &mut sink,
+            &mut stream,
+            player,
+            &mut audio_rx,
+            &mut capture,
+            &mut cancel_rx,
+            &mut machine,
+            tools,
+        )
+        .await
+        .unwrap();
+
+        let sent = sink_state.lock().unwrap().sent.clone();
+        let output_events = sent
+            .iter()
+            .filter_map(|message| match message {
+                Message::Text(text) if text.contains("function_call_output") => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_events.len(), 1);
+        assert!(output_events
+            .iter()
+            .any(|event| event.contains("light.kitchen") && event.contains("changed")));
+        assert_eq!(
+            player_state.played.lock().unwrap().as_slice(),
+            &[vec![0, 1]]
+        );
+        assert_full_teardown(&sink_state, &player_state, &capture_dropped);
+    }
+
+    #[tokio::test]
+    async fn native_tool_loop_fails_closed_on_unmatched_and_duplicate_calls() {
+        let cases = vec![
+            (
+                vec![function_call("call-1"), function_call("call-1")],
+                "replayed Qwen function call ID",
+            ),
+            (
+                vec![
+                    function_call("call-1"),
+                    function_call_with(
+                        "call-2",
+                        "other-response",
+                        "tool-item-2",
+                        1,
+                        "ha_turn_on",
+                        "{\"entity_id\":\"light.kitchen\"}",
+                    ),
+                ],
+                "conflicting response",
+            ),
+            (
+                vec![
+                    function_call("call-1"),
+                    tool_response_done_with(
+                        "call-1",
+                        "tool-response",
+                        "tool-item",
+                        "different_name",
+                        "{\"entity_id\":\"light.kitchen\"}",
+                    ),
+                ],
+                "conflicting function call data",
+            ),
+            (vec![tool_response_done()], "do not match arguments events"),
+            (
+                vec![function_call_with(
+                    "",
+                    "tool-response",
+                    "tool-item",
+                    0,
+                    "ha_turn_on",
+                    "{}",
+                )],
+                "invalid Qwen function call ID",
+            ),
+        ];
+        for (messages, expected) in cases {
+            let calls = Arc::new(AtomicU64::new(0));
+            let server = rig_core::tool::server::ToolServer::new()
+                .tool(MockMcpTool {
+                    fail: false,
+                    pending: None,
+                    calls: Some(calls.clone()),
+                })
+                .run();
+            let tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), server)
+                .await
+                .unwrap();
+            let (result, sink, player, capture) =
+                run_tool_messages(messages, tools, Duration::from_millis(50)).await;
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_full_teardown(&sink, &player, &capture);
+        }
+    }
+
+    #[tokio::test]
+    async fn later_iteration_call_id_replay_fails_closed_without_second_mcp_call() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let server = rig_core::tool::server::ToolServer::new()
+            .tool(MockMcpTool {
+                fail: false,
+                pending: None,
+                calls: Some(calls.clone()),
+            })
+            .run();
+        let config = QwenRealtimeConfig {
+            max_tool_calls: 2,
+            max_tool_iterations: 2,
+            ..QwenRealtimeConfig::default()
+        };
+        let tools = NativeToolRuntime::load(&config, server).await.unwrap();
+        let messages = vec![
+            function_call("call-replay"),
+            tool_response_done_with(
+                "call-replay",
+                "tool-response",
+                "tool-item",
+                "ha_turn_on",
+                "{\"entity_id\":\"light.kitchen\"}",
+            ),
+            function_call_with(
+                "call-replay",
+                "later-response",
+                "later-item",
+                0,
+                "ha_turn_on",
+                "{\"entity_id\":\"light.kitchen\"}",
+            ),
+        ];
+
+        let (result, sink, player, capture) =
+            run_tool_messages(messages, tools, Duration::from_millis(100)).await;
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("replayed Qwen function call ID"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_full_teardown(&sink, &player, &capture);
+    }
+
+    #[tokio::test]
+    async fn malformed_arguments_return_structured_ws_output_without_mcp_execution() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let server = rig_core::tool::server::ToolServer::new()
+            .tool(MockMcpTool {
+                fail: false,
+                pending: None,
+                calls: Some(calls.clone()),
+            })
+            .run();
+        let tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), server)
+            .await
+            .unwrap();
+        let messages = vec![
+            function_call_with(
+                "call-bad",
+                "tool-response",
+                "tool-item",
+                0,
+                "ha_turn_on",
+                "{",
+            ),
+            tool_response_done_with("call-bad", "tool-response", "tool-item", "ha_turn_on", "{"),
+        ];
+
+        let (result, sink, player, capture) =
+            run_tool_messages(messages, tools, Duration::from_millis(50)).await;
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("timed out waiting"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sink.lock().unwrap().sent.iter().any(|message| matches!(
+            message,
+            Message::Text(text)
+                if text.contains("function_call_output") && text.contains("invalid_arguments")
+        )));
+        assert_full_teardown(&sink, &player, &capture);
+    }
+
+    #[tokio::test]
+    async fn native_tool_loop_deadline_and_call_limit_stop_without_execution() {
+        let cases = [
+            (
+                QwenRealtimeConfig::default(),
+                function_call("call-timeout"),
+                "timed out waiting",
+            ),
+            (
+                QwenRealtimeConfig {
+                    max_tool_calls: 0,
+                    ..QwenRealtimeConfig::default()
+                },
+                function_call("call-over-limit"),
+                "tool call limit reached",
+            ),
+        ];
+        for (config, message, expected) in cases {
+            let calls = Arc::new(AtomicU64::new(0));
+            let server = rig_core::tool::server::ToolServer::new()
+                .tool(MockMcpTool {
+                    fail: false,
+                    pending: None,
+                    calls: Some(calls.clone()),
+                })
+                .run();
+            let tools = NativeToolRuntime::load(&config, server).await.unwrap();
+            let (result, sink, player, capture) =
+                run_tool_messages(vec![message], tools, Duration::from_millis(20)).await;
+            assert!(result.unwrap_err().to_string().contains(expected));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_full_teardown(&sink, &player, &capture);
+        }
+    }
+
+    #[tokio::test]
+    async fn production_reconnect_loop_retries_before_tool_effect_and_runs_mcp_once() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let server = rig_core::tool::server::ToolServer::new()
+            .tool(MockMcpTool {
+                fail: false,
+                pending: None,
+                calls: Some(calls.clone()),
+            })
+            .run();
+        let tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), server)
+            .await
+            .unwrap();
+        let final_done =
+            Message::Text(include_str!("../tests/fixtures/qwen_server_response_done.json").into());
+        let mut connector = MockRealtimeConnector {
+            plans: VecDeque::from([
+                vec![Message::Close(None)],
+                vec![function_call("call-1"), tool_response_done(), final_done],
+            ]),
+            tools: tools.clone(),
+            attempts: 0,
+            sinks: Vec::new(),
+        };
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        run_realtime_session_loop(&tools, &mut cancel_rx, &mut connector)
+            .await
+            .unwrap();
+
+        assert_eq!(connector.attempts, 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!transparent_reconnect_allowed(&tools));
+        assert!(connector
+            .sinks
+            .iter()
+            .all(|sink| sink.lock().unwrap().closed));
+    }
+
+    #[tokio::test]
+    async fn production_reconnect_loop_fails_closed_after_mcp_without_replay() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let server = rig_core::tool::server::ToolServer::new()
+            .tool(MockMcpTool {
+                fail: false,
+                pending: None,
+                calls: Some(calls.clone()),
+            })
+            .run();
+        let tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), server)
+            .await
+            .unwrap();
+        let tool_done = tool_response_done_with(
+            "call-replay",
+            "tool-response",
+            "tool-item",
+            "ha_turn_on",
+            "{\"entity_id\":\"light.kitchen\"}",
+        );
+        let mut connector = MockRealtimeConnector {
+            plans: VecDeque::from([
+                vec![
+                    function_call("call-replay"),
+                    tool_done.clone(),
+                    Message::Close(None),
+                ],
+                vec![function_call("call-replay"), tool_done],
+            ]),
+            tools: tools.clone(),
+            attempts: 0,
+            sinks: Vec::new(),
+        };
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+
+        let error = run_realtime_session_loop(&tools, &mut cancel_rx, &mut connector)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("transparent reconnect disabled"));
+        assert_eq!(connector.attempts, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(connector.plans.len(), 1, "replay websocket was not opened");
+        assert!(connector.sinks[0].lock().unwrap().closed);
+    }
+
+    #[tokio::test]
+    async fn native_tool_failures_are_structured_outputs() {
+        let tool_server = rig_core::tool::server::ToolServer::new()
+            .tool(MockMcpTool {
+                fail: true,
+                pending: None,
+                calls: None,
+            })
+            .run();
+        let config = QwenRealtimeConfig {
+            max_tool_iterations: 2,
+            max_tool_calls: 4,
+            ..QwenRealtimeConfig::default()
+        };
+        let tools = NativeToolRuntime::load(&config, tool_server).await.unwrap();
+
+        let failure = tools
+            .execute(
+                CallId::new("call-fail"),
+                "ha_turn_on".to_string(),
+                "{\"entity_id\":\"light.kitchen\"}".to_string(),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&failure.output).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"]["kind"], "tool_error");
+        let malformed = tools
+            .execute(
+                CallId::new("call-bad-json"),
+                "ha_turn_on".to_string(),
+                "{".to_string(),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&malformed.output).unwrap();
+        assert_eq!(parsed["error"]["kind"], "invalid_arguments");
+    }
+
+    #[tokio::test]
+    async fn mock_websocket_surfaces_mcp_error_but_fails_closed_on_generic_timeout() {
+        for (fail, pending, expected_output, expected_error) in [
+            (true, None, Some("tool_error"), "timed out waiting"),
+            (
+                false,
+                Some(Arc::new(tokio::sync::Notify::new())),
+                None,
+                "generic tool outcome was ambiguous",
+            ),
+        ] {
+            let server = rig_core::tool::server::ToolServer::new()
+                .tool(MockMcpTool {
+                    fail,
+                    pending,
+                    calls: None,
+                })
+                .run();
+            let mut tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), server)
+                .await
+                .unwrap();
+            tools.call_timeout = Duration::from_millis(20);
+            let (result, sink, player, capture) = run_tool_messages(
+                vec![function_call("call-1"), tool_response_done()],
+                tools,
+                Duration::from_millis(100),
+            )
+            .await;
+            assert!(result.unwrap_err().to_string().contains(expected_error));
+            let sent = sink.lock().unwrap();
+            match expected_output {
+                Some(expected) => assert!(sent.sent.iter().any(|message| matches!(
+                    message,
+                    Message::Text(text)
+                        if text.contains("function_call_output") && text.contains(expected)
+                ))),
+                None => assert!(!sent.sent.iter().any(|message| matches!(
+                    message,
+                    Message::Text(text) if text.contains("function_call_output")
+                ))),
+            }
+            drop(sent);
+            assert_full_teardown(&sink, &player, &capture);
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_shell_timeout_kills_descendants_and_blocks_retry_side_effects() {
+        let path = side_effect_path("timeout");
+        let server = rig_core::tool::server::ToolServer::new()
+            .tool(SideEffectShellTool {
+                script: side_effect_script(&path),
+            })
+            .run();
+        let mut tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), server)
+            .await
+            .unwrap();
+        tools.call_timeout = Duration::from_millis(30);
+        let stream = futures::stream::iter([
+            Ok::<_, MockWsError>(function_call_with(
+                "call-timeout",
+                "tool-response",
+                "item-timeout",
+                0,
+                SideEffectShellTool::NAME,
+                "{}",
+            )),
+            Ok(tool_response_done_with(
+                "call-timeout",
+                "tool-response",
+                "item-timeout",
+                SideEffectShellTool::NAME,
+                "{}",
+            )),
+        ])
+        .chain(futures::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            Ok(function_call_with(
+                "call-retry",
+                "tool-response",
+                "item-retry",
+                0,
+                SideEffectShellTool::NAME,
+                "{}",
+            ))
+        }))
+        .chain(futures::stream::iter([Ok(tool_response_done_with(
+            "call-retry",
+            "tool-response",
+            "item-retry",
+            SideEffectShellTool::NAME,
+            "{}",
+        ))]))
+        .chain(futures::stream::pending())
+        .boxed();
+
+        let (result, sink, player, capture) =
+            run_tool_stream(stream, tools, Duration::from_millis(100)).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("generic tool outcome was ambiguous"));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "run\n");
+        assert!(!sink.lock().unwrap().sent.iter().any(|message| matches!(
+            message,
+            Message::Text(text) if text.contains("function_call_output")
+        )));
+        assert_full_teardown(&sink, &player, &capture);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn session_cancellation_kills_generic_shell_descendants_before_returning() {
+        let path = side_effect_path("cancel");
+        let server = rig_core::tool::server::ToolServer::new()
+            .tool(SideEffectShellTool {
+                script: side_effect_script(&path),
+            })
+            .run();
+        let tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), server)
+            .await
+            .unwrap();
+        let stream = futures::stream::iter([
+            Ok::<_, MockWsError>(function_call_with(
+                "call-cancel",
+                "tool-response",
+                "item-cancel",
+                0,
+                SideEffectShellTool::NAME,
+                "{}",
+            )),
+            Ok(tool_response_done_with(
+                "call-cancel",
+                "tool-response",
+                "item-cancel",
+                SideEffectShellTool::NAME,
+                "{}",
+            )),
+        ])
+        .chain(futures::stream::pending())
+        .boxed();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let task = tokio::spawn(run_tool_stream_with_cancel(
+            stream,
+            tools,
+            Duration::from_millis(100),
+            cancel_rx,
+        ));
+        timeout(Duration::from_secs(1), async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shell side effect never started");
+        cancel_tx.send(true).unwrap();
+        let (result, sink, player, capture) = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled session cleanup was not bounded")
+            .unwrap();
+        assert!(result.is_ok());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "run\n");
+        assert_full_teardown(&sink, &player, &capture);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn native_routing_uses_initial_discovery_without_a_second_list_or_generic_fallback() {
+        let server = DynamicRoutingRmcpServer::new(vec![routing_test_tool("hang_initial")])
+            .failing_after_initial_discovery();
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_service = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .serve((server_from_client, server_to_client))
+                    .await
+                    .expect("server failed to start")
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let (native_mcp, peer) = crate::mcp::connect_native_test_client(
+            (client_from_server, client_to_server),
+            tool_server.clone(),
+        )
+        .await
+        .expect("native client failed to connect");
+        let server_service = server_service.await.unwrap();
+        assert_eq!(server.list_calls.load(Ordering::SeqCst), 1);
+
+        let config = QwenRealtimeConfig {
+            tool_timeout_s: 0.02,
+            ..QwenRealtimeConfig::default()
+        };
+        let tools =
+            NativeToolRuntime::load_with_native_mcp(&config, tool_server, Some(native_mcp.clone()))
+                .await
+                .unwrap();
+        let first = tools
+            .execute(
+                CallId::new("initial-timeout"),
+                "hang_initial".to_string(),
+                "{}".to_string(),
+            )
+            .await;
+        let retry = tools
+            .execute(
+                CallId::new("initial-retry"),
+                "hang_initial".to_string(),
+                "{}".to_string(),
+            )
+            .await;
+        assert!(first.output.contains("timeout"));
+        assert!(retry.output.contains("mcp_fail_closed"));
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server.in_flight.load(Ordering::SeqCst), 0);
+        assert!(native_mcp.wait_for_idle(Duration::from_secs(1)).await);
+        assert!(peer.is_transport_closed());
+        timeout(Duration::from_secs(1), server_service.waiting())
+            .await
+            .expect("initial-discovery RMCP service leaked")
+            .expect("initial-discovery RMCP server failed");
+    }
+
+    #[tokio::test]
+    async fn poisoned_native_routing_fails_closed_without_fallback_or_service_leak() {
+        let server = DynamicRoutingRmcpServer::new(vec![routing_test_tool("must_not_run")]);
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_service = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .serve((server_from_client, server_to_client))
+                    .await
+                    .expect("server failed to start")
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let (native_mcp, peer) = crate::mcp::connect_native_test_client(
+            (client_from_server, client_to_server),
+            tool_server.clone(),
+        )
+        .await
+        .expect("native client failed to connect");
+        let server_service = server_service.await.unwrap();
+        let tools = NativeToolRuntime::load_with_native_mcp(
+            &QwenRealtimeConfig::default(),
+            tool_server,
+            Some(native_mcp.clone()),
+        )
+        .await
+        .unwrap();
+        native_mcp.poison_routing_lock();
+
+        for call_id in ["poisoned-first", "poisoned-second"] {
+            let execution = tools
+                .execute(
+                    CallId::new(call_id),
+                    "must_not_run".to_string(),
+                    "{}".to_string(),
+                )
+                .await;
+            assert!(execution.output.contains("mcp_fail_closed"));
+        }
+
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.in_flight.load(Ordering::SeqCst), 0);
+        assert!(native_mcp.wait_for_idle(Duration::from_secs(1)).await);
+        assert!(peer.is_transport_closed());
+        timeout(Duration::from_secs(1), server_service.waiting())
+            .await
+            .expect("poisoned-routing RMCP service leaked")
+            .expect("poisoned-routing RMCP server failed");
+    }
+
+    #[tokio::test]
+    async fn failed_initial_native_discovery_closes_service_before_exposing_tools() {
+        let server = DynamicRoutingRmcpServer::new(vec![routing_test_tool("must_not_run")])
+            .failing_initial_discovery();
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_service = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .serve((server_from_client, server_to_client))
+                    .await
+                    .expect("server failed to start")
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let error = match crate::mcp::connect_native_test_client(
+            (client_from_server, client_to_server),
+            tool_server.clone(),
+        )
+        .await
+        {
+            Ok(_) => panic!("native discovery failure must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.contains("configured routing discovery failure"));
+        assert_eq!(server.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.in_flight.load(Ordering::SeqCst), 0);
+        assert!(tool_server.get_tool_defs(None).await.unwrap().is_empty());
+
+        let server_service = server_service.await.unwrap();
+        timeout(Duration::from_secs(1), server_service.waiting())
+            .await
+            .expect("failed-discovery RMCP service leaked")
+            .expect("failed-discovery RMCP server failed");
+    }
+
+    #[tokio::test]
+    async fn hanging_initial_native_discovery_is_bounded_and_closes_service() {
+        let server = DynamicRoutingRmcpServer::new(vec![routing_test_tool("must_not_run")])
+            .hanging_initial_discovery();
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_service = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .serve((server_from_client, server_to_client))
+                    .await
+                    .expect("server failed to start")
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let result = timeout(
+            Duration::from_secs(1),
+            crate::mcp::connect_native_test_client(
+                (client_from_server, client_to_server),
+                tool_server.clone(),
+            ),
+        )
+        .await
+        .expect("native initial discovery was unbounded");
+        assert!(result.is_err());
+        assert_eq!(server.list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.in_flight.load(Ordering::SeqCst), 0);
+        assert!(tool_server.get_tool_defs(None).await.unwrap().is_empty());
+
+        let server_service = server_service.await.unwrap();
+        timeout(Duration::from_secs(6), server_service.waiting())
+            .await
+            .expect("hanging-discovery RMCP service leaked")
+            .expect("hanging-discovery RMCP server failed");
+    }
+
+    async fn assert_hanging_refresh_fails_closed(notification_count: usize) {
+        let server = DynamicRoutingRmcpServer::new(vec![routing_test_tool("initial_tool")])
+            .hanging_after_initial_discovery();
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_service = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .serve((server_from_client, server_to_client))
+                    .await
+                    .expect("server failed to start")
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let (native_mcp, peer) = crate::mcp::connect_native_test_client(
+            (client_from_server, client_to_server),
+            tool_server.clone(),
+        )
+        .await
+        .expect("native client failed to connect");
+        let server_service = server_service.await.unwrap();
+        server_service
+            .peer()
+            .notify_tool_list_changed()
+            .await
+            .expect("failed to notify tool list change");
+        timeout(Duration::from_secs(1), async {
+            while server.list_calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh list request never started");
+        for _ in 1..notification_count {
+            server_service
+                .peer()
+                .notify_tool_list_changed()
+                .await
+                .expect("failed to flood tool list change");
+        }
+        timeout(Duration::from_secs(1), async {
+            while !peer.is_transport_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hanging refresh did not close the transport");
+
+        let tools = NativeToolRuntime::load_with_native_mcp(
+            &QwenRealtimeConfig::default(),
+            tool_server,
+            Some(native_mcp.clone()),
+        )
+        .await
+        .unwrap();
+        for call_id in ["refresh-first", "refresh-retry"] {
+            let result = tools
+                .execute(
+                    CallId::new(call_id),
+                    "initial_tool".to_string(),
+                    "{}".to_string(),
+                )
+                .await;
+            assert!(result.output.contains("mcp_fail_closed"));
+        }
+        assert_eq!(server.list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.in_flight.load(Ordering::SeqCst), 0);
+        assert!(native_mcp.wait_for_idle(Duration::from_secs(1)).await);
+        timeout(Duration::from_secs(6), server_service.waiting())
+            .await
+            .expect("hanging-refresh RMCP service leaked")
+            .expect("hanging-refresh RMCP server failed");
+    }
+
+    #[tokio::test]
+    async fn hanging_native_list_refresh_is_bounded_and_fails_closed_without_fallback() {
+        assert_hanging_refresh_fails_closed(1).await;
+    }
+
+    #[tokio::test]
+    async fn flooded_native_list_refresh_is_single_flight_and_fails_closed() {
+        assert_hanging_refresh_fails_closed(128).await;
+    }
+
+    #[tokio::test]
+    async fn list_changed_addition_uses_managed_cancellation_and_leaves_no_worker() {
+        let server = DynamicRoutingRmcpServer::new(vec![routing_test_tool("initial_tool")]);
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_service = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .serve((server_from_client, server_to_client))
+                    .await
+                    .expect("server failed to start")
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let (native_mcp, peer) = crate::mcp::connect_native_test_client(
+            (client_from_server, client_to_server),
+            tool_server.clone(),
+        )
+        .await
+        .expect("native client failed to connect");
+        let server_service = server_service.await.unwrap();
+        server
+            .set_tools(vec![routing_test_tool("hang_added")])
+            .await;
+        server_service
+            .peer()
+            .notify_tool_list_changed()
+            .await
+            .expect("failed to notify tool list change");
+        timeout(Duration::from_secs(1), async {
+            while !native_mcp.has_tool("hang_added") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native routing did not observe list_changed addition");
+        assert_eq!(server.list_calls.load(Ordering::SeqCst), 2);
+
+        let config = QwenRealtimeConfig {
+            tool_timeout_s: 0.02,
+            ..QwenRealtimeConfig::default()
+        };
+        let tools =
+            NativeToolRuntime::load_with_native_mcp(&config, tool_server, Some(native_mcp.clone()))
+                .await
+                .unwrap();
+        assert!(tools.definitions.iter().any(|definition| matches!(
+            definition,
+            ToolDefinition::Function { function } if function.name == "hang_added"
+        )));
+        let first = tools
+            .execute(
+                CallId::new("added-timeout"),
+                "hang_added".to_string(),
+                "{}".to_string(),
+            )
+            .await;
+        let retry = tools
+            .execute(
+                CallId::new("added-retry"),
+                "hang_added".to_string(),
+                "{}".to_string(),
+            )
+            .await;
+        assert!(first.output.contains("timeout"));
+        assert!(retry.output.contains("mcp_fail_closed"));
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(server.in_flight.load(Ordering::SeqCst), 0);
+        assert!(native_mcp.wait_for_idle(Duration::from_secs(1)).await);
+        assert!(peer.is_transport_closed());
+        timeout(Duration::from_secs(1), server_service.waiting())
+            .await
+            .expect("list_changed RMCP service leaked")
+            .expect("list_changed RMCP server failed");
+    }
+
+    #[tokio::test]
+    async fn native_rmcp_timeout_cleans_up_and_retry_fails_closed_in_production_loop() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn({
+            let started = started.clone();
+            let stopped = stopped.clone();
+            let calls = calls.clone();
+            let in_flight = in_flight.clone();
+            async move {
+                let running = CancellableRmcpServer {
+                    started,
+                    stopped,
+                    calls,
+                    in_flight,
+                }
+                .serve((server_from_client, server_to_client))
+                .await
+                .expect("server failed to start");
+                running.waiting().await.expect("server error");
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let handler =
+            crate::mcp::home_assistant_handler(ClientInfo::default(), tool_server.clone());
+        let service = handler
+            .connect((client_from_server, client_to_server))
+            .await
+            .expect("client failed to connect");
+        let peer = service.peer().clone();
+        let native_mcp = NativeMcpClient::new(service, ["hang_forever".to_string()]);
+        let config = QwenRealtimeConfig {
+            tool_timeout_s: 0.02,
+            max_tool_calls: 2,
+            max_tool_iterations: 2,
+            ..QwenRealtimeConfig::default()
+        };
+        let tools =
+            NativeToolRuntime::load_with_native_mcp(&config, tool_server, Some(native_mcp.clone()))
+                .await
+                .unwrap();
+        let initial_messages = vec![
+            function_call_with(
+                "call-timeout",
+                "tool-response",
+                "tool-item",
+                0,
+                "hang_forever",
+                "{}",
+            ),
+            tool_response_done_with(
+                "call-timeout",
+                "tool-response",
+                "tool-item",
+                "hang_forever",
+                "{}",
+            ),
+        ];
+        let retry_call = function_call_with(
+            "call-retry",
+            "retry-response",
+            "retry-item",
+            0,
+            "hang_forever",
+            "{}",
+        );
+        let retry_done = tool_response_done_with(
+            "call-retry",
+            "retry-response",
+            "retry-item",
+            "hang_forever",
+            "{}",
+        );
+        let retry_after_cleanup = stopped.clone();
+        let stream = futures::stream::iter(initial_messages.into_iter().map(Ok::<_, MockWsError>))
+            .chain(futures::stream::once(async move {
+                retry_after_cleanup.notified().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(retry_call)
+            }))
+            .chain(futures::stream::iter([Ok(retry_done)]))
+            .chain(futures::stream::pending())
+            .boxed();
+
+        let (result, sink, player, capture) =
+            run_tool_stream(stream, tools, Duration::from_millis(100)).await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("timed out waiting"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+        assert!(native_mcp.is_poisoned());
+        assert!(native_mcp.wait_for_idle(Duration::from_millis(50)).await);
+        let sent = sink.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|message| matches!(
+            message,
+            Message::Text(text)
+                if text.contains("function_call_output") && text.contains("\\\"timeout\\\"")
+        )));
+        assert!(sent.iter().any(|message| matches!(
+            message,
+            Message::Text(text)
+                if text.contains("function_call_output") && text.contains("mcp_fail_closed")
+        )));
+        assert_full_teardown(&sink, &player, &capture);
+
+        assert!(peer.is_transport_closed());
+        assert!(peer.list_all_tools().await.is_err());
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("RMCP server task leaked")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_cooperative_rmcp_timeout_closes_service_before_idle_without_retry() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let transport_closed = Arc::new(AtomicBool::new(false));
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn({
+            let server = NonCooperativeRmcpServer {
+                started: started.clone(),
+                stopped: stopped.clone(),
+                calls: calls.clone(),
+                in_flight: in_flight.clone(),
+                transport_closed: transport_closed.clone(),
+            };
+            async move {
+                let server_from_client = EofObservedReader {
+                    inner: server_from_client,
+                    transport_closed,
+                };
+                server
+                    .serve((server_from_client, server_to_client))
+                    .await
+                    .expect("server failed to start")
+                    .waiting()
+                    .await
+                    .expect("server failed while running");
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let handler = crate::mcp::home_assistant_handler(ClientInfo::default(), tool_server);
+        let service = handler
+            .connect((client_from_server, client_to_server))
+            .await
+            .expect("client failed to connect");
+        let peer = service.peer().clone();
+        let native_mcp = NativeMcpClient::new(service, ["hang_forever".to_string()]);
+
+        let result = timeout(
+            Duration::from_secs(1),
+            native_mcp.call("hang_forever", "{}", Duration::from_millis(20)),
+        )
+        .await
+        .expect("non-cooperative RMCP cleanup was unbounded");
+        assert!(matches!(result, Err(NativeMcpCallError::Timeout)));
+        assert!(native_mcp.wait_for_idle(Duration::from_secs(1)).await);
+        assert!(peer.is_transport_closed());
+        timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("non-cooperative RMCP handler was not dropped");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            native_mcp
+                .call("hang_forever", "{}", Duration::from_millis(20))
+                .await,
+            Err(NativeMcpCallError::FailClosed)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("RMCP server task leaked")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_deadline_before_rmcp_request_handle_close_service_and_join_worker() {
+        for cancel_by_drop in [false, true] {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let stopped = Arc::new(tokio::sync::Notify::new());
+            let calls = Arc::new(AtomicU64::new(0));
+            let in_flight = Arc::new(AtomicU64::new(0));
+            let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+            let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+            let server_task = tokio::spawn({
+                let server = CancellableRmcpServer {
+                    started,
+                    stopped,
+                    calls: calls.clone(),
+                    in_flight: in_flight.clone(),
+                };
+                async move {
+                    server
+                        .serve((server_from_client, server_to_client))
+                        .await
+                        .expect("server failed to start")
+                        .waiting()
+                        .await
+                        .expect("server failed while running");
+                }
+            });
+            let tool_server = rig_core::tool::server::ToolServer::new().run();
+            let handler = crate::mcp::home_assistant_handler(ClientInfo::default(), tool_server);
+            let service = handler
+                .connect((client_from_server, client_to_server))
+                .await
+                .expect("client failed to connect");
+            let peer = service.peer().clone();
+            let establishment_arrived = Arc::new(tokio::sync::Notify::new());
+            let establishment_release = Arc::new(tokio::sync::Notify::new());
+            let native_mcp = NativeMcpClient::new_with_request_establishment_gate(
+                service,
+                ["hang_forever".to_string()],
+                establishment_arrived.clone(),
+                establishment_release,
+            );
+            let worker_client = native_mcp.clone();
+            let call_task = tokio::spawn(async move {
+                worker_client
+                    .call("hang_forever", "{}", Duration::from_millis(20))
+                    .await
+            });
+            timeout(Duration::from_secs(1), establishment_arrived.notified())
+                .await
+                .expect("request establishment did not reach the deterministic gate");
+
+            if cancel_by_drop {
+                call_task.abort();
+                assert!(call_task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(matches!(
+                    timeout(Duration::from_secs(1), call_task)
+                        .await
+                        .expect("pre-handle deadline cleanup was unbounded")
+                        .expect("native MCP caller task panicked"),
+                    Err(NativeMcpCallError::Timeout)
+                ));
+            }
+
+            assert!(native_mcp.wait_for_idle(Duration::from_secs(1)).await);
+            assert!(native_mcp.is_poisoned());
+            assert!(peer.is_transport_closed());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+            timeout(Duration::from_secs(1), server_task)
+                .await
+                .expect("RMCP server task leaked")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_native_rmcp_call_sends_protocol_cancellation_and_joins_worker() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let (client_to_server, server_from_client) = tokio::io::duplex(8192);
+        let (server_to_client, client_from_server) = tokio::io::duplex(8192);
+        let server_task = tokio::spawn({
+            let server = CancellableRmcpServer {
+                started: started.clone(),
+                stopped: stopped.clone(),
+                calls: calls.clone(),
+                in_flight: in_flight.clone(),
+            };
+            async move {
+                server
+                    .serve((server_from_client, server_to_client))
+                    .await
+                    .expect("server failed to start")
+                    .waiting()
+                    .await
+                    .expect("server failed while running");
+            }
+        });
+        let tool_server = rig_core::tool::server::ToolServer::new().run();
+        let handler = crate::mcp::home_assistant_handler(ClientInfo::default(), tool_server);
+        let service = handler
+            .connect((client_from_server, client_to_server))
+            .await
+            .expect("client failed to connect");
+        let peer = service.peer().clone();
+        let native_mcp = NativeMcpClient::new(service, ["hang_forever".to_string()]);
+        let call_client = native_mcp.clone();
+        let call = tokio::spawn(async move {
+            call_client
+                .call("hang_forever", "{}", Duration::from_secs(60))
+                .await
+        });
+
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("RMCP call never started");
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(native_mcp.wait_for_idle(Duration::from_secs(1)).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+        assert!(native_mcp.is_poisoned());
+        assert!(peer.is_transport_closed());
+        assert!(peer.list_all_tools().await.is_err());
+
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("RMCP server task leaked")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_preempts_an_in_flight_native_tool_call() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let tool_server = rig_core::tool::server::ToolServer::new()
+            .tool(MockMcpTool {
+                fail: false,
+                pending: Some(started.clone()),
+                calls: None,
+            })
+            .run();
+        let tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), tool_server)
+            .await
+            .unwrap();
+        let sink_state = Arc::new(StdMutex::new(MockSinkState::default()));
+        let player_state = Arc::new(MockPlayerState::default());
+        let capture_dropped = Arc::new(AtomicBool::new(false));
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task_sink = sink_state.clone();
+        let task_player = player_state.clone();
+        let task_capture = capture_dropped.clone();
+
+        let task = tokio::spawn(async move {
+            let mut sink = MockSink { state: task_sink };
+            let mut stream = futures::stream::iter([
+                Ok::<Message, MockWsError>(function_call("call-pending")),
+                Ok(tool_response_done_with(
+                    "call-pending",
+                    "tool-response",
+                    "tool-item",
+                    "ha_turn_on",
+                    "{\"entity_id\":\"light.kitchen\"}",
+                )),
+                Ok(audio_delta_for("tool-response")),
+            ])
+            .chain(futures::stream::pending());
+            let player = MockPlayer {
+                state: task_player,
+                playback: MockPlayback::Accept,
+                shutdown_gate: None,
+            };
+            let (audio_tx, mut audio_rx) = mpsc::channel(1);
+            let _keep_audio_open = audio_tx;
+            let mut capture = pending_capture(task_capture);
+            let mut machine = capturing_machine();
+            run_connected_resources_with_tools(
+                &mut sink,
+                &mut stream,
+                player,
+                &mut audio_rx,
+                &mut capture,
+                &mut cancel_rx,
+                &mut machine,
+                tools,
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("tool call did not start");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !player_state.played.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("audio streaming was blocked by the in-flight tool call");
+        cancel_tx.send(true).unwrap();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled tool session did not stop")
+            .unwrap()
+            .unwrap();
+
+        assert_full_teardown(&sink_state, &player_state, &capture_dropped);
+        let sent = sink_state.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|message| matches!(
+            message,
+            Message::Text(text) if text.contains("response.cancel")
+        )));
+        assert!(!sent.iter().any(|message| matches!(
+            message,
+            Message::Text(text) if text.contains("function_call_output")
+        )));
     }
 
     #[tokio::test]
@@ -2148,6 +4781,7 @@ mod tests {
         let service = Arc::new(QwenVoiceService::new(
             QwenRealtimeConfig::default(),
             CaptureConfig::default(),
+            rig_core::tool::server::ToolServer::new().run(),
         ));
         let ledger = Arc::new(StdMutex::new(Vec::new()));
         let started = Arc::new(tokio::sync::Notify::new());
@@ -2196,6 +4830,7 @@ mod tests {
         let service = Arc::new(QwenVoiceService::new(
             QwenRealtimeConfig::default(),
             CaptureConfig::default(),
+            rig_core::tool::server::ToolServer::new().run(),
         ));
         let control = service.prepare_session_control();
         let turn_handle = control.handle.clone();
@@ -2278,6 +4913,7 @@ mod tests {
         let service = Arc::new(QwenVoiceService::new(
             QwenRealtimeConfig::default(),
             CaptureConfig::default(),
+            rig_core::tool::server::ToolServer::new().run(),
         ));
         let live_players = Arc::new(AtomicU64::new(0));
         let max_live_players = Arc::new(AtomicU64::new(0));
@@ -2345,6 +4981,7 @@ mod tests {
         let service = Arc::new(QwenVoiceService::new(
             QwenRealtimeConfig::default(),
             CaptureConfig::default(),
+            rig_core::tool::server::ToolServer::new().run(),
         ));
         let sink_state = Arc::new(StdMutex::new(MockSinkState {
             block_all_sends: true,
@@ -2397,6 +5034,7 @@ mod tests {
                                 &mut audio_rx,
                                 &mut capture,
                                 (&mut cancel_rx, Duration::from_secs(30), &mut machine),
+                                None,
                             )
                             .await;
                             assert!(weak_upload.upgrade().is_none());
@@ -2509,6 +5147,27 @@ mod tests {
             SessionState::Capturing,
             SessionState::Responding,
             SessionState::Cancelling,
+            SessionState::ShuttingDown,
+            SessionState::Closed,
+        ] {
+            machine.transition(state).unwrap();
+        }
+        assert_eq!(machine.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn state_machine_accepts_disconnect_reconnect_cycle() {
+        let mut machine = SessionMachine::new();
+        for state in [
+            SessionState::Connecting,
+            SessionState::Ready,
+            SessionState::Capturing,
+            SessionState::Responding,
+            SessionState::Reconnecting,
+            SessionState::Connecting,
+            SessionState::Ready,
+            SessionState::Capturing,
+            SessionState::Responding,
             SessionState::ShuttingDown,
             SessionState::Closed,
         ] {

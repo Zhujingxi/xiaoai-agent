@@ -103,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
         config.voice.runtime,
         config.voice.qwen.clone(),
         config.capture.clone(),
+        agent.tool_server(),
+        agent.native_mcp_client(),
     );
 
     let (kws_tx, mut kws_rx) = mpsc::channel::<KwsMonitorEvent>(16);
@@ -409,8 +411,11 @@ fn build_qwen_voice_service(
     runtime: VoiceRuntime,
     config: QwenRealtimeConfig,
     capture: CaptureConfig,
+    tool_server: rig_core::tool::server::ToolServerHandle,
+    native_mcp: Option<crate::mcp::NativeMcpClient>,
 ) -> Option<QwenVoiceService> {
-    uses_native_qwen(runtime).then(|| QwenVoiceService::new(config, capture))
+    uses_native_qwen(runtime)
+        .then(|| QwenVoiceService::new(config, capture, tool_server).with_native_mcp(native_mcp))
 }
 
 #[cfg(test)]
@@ -421,10 +426,18 @@ mod tests {
     fn voice_runtime_routes_legacy_and_native_behavior_separately() {
         let config = QwenRealtimeConfig::default();
         let capture = CaptureConfig::default();
+        let tools = rig_core::tool::server::ToolServer::new().run();
+        assert!(build_qwen_voice_service(
+            VoiceRuntime::Legacy,
+            config.clone(),
+            capture.clone(),
+            tools.clone(),
+            None,
+        )
+        .is_none());
         assert!(
-            build_qwen_voice_service(VoiceRuntime::Legacy, config.clone(), capture.clone())
-                .is_none()
+            build_qwen_voice_service(VoiceRuntime::NativeQwen, config, capture, tools, None)
+                .is_some()
         );
-        assert!(build_qwen_voice_service(VoiceRuntime::NativeQwen, config, capture).is_some());
     }
 }

@@ -1,7 +1,6 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 macro_rules! string_newtype {
     ($name:ident) => {
@@ -103,39 +102,8 @@ pub enum ToolDefinition {
 pub struct FunctionDefinition {
     pub name: String,
     pub description: String,
-    pub parameters: FunctionParameters,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FunctionParameters {
-    #[serde(rename = "type")]
-    pub schema_type: ObjectSchemaType,
-    pub properties: BTreeMap<String, FunctionProperty>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ObjectSchemaType {
-    #[serde(rename = "object")]
-    Object,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FunctionProperty {
-    #[serde(rename = "type")]
-    pub schema_type: PropertySchemaType,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PropertySchemaType {
-    String,
-    Number,
-    Integer,
-    Boolean,
+    /// Preserve the original JSON Schema without losing MCP constraints.
+    pub parameters: Value,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

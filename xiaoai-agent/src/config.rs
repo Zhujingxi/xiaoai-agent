@@ -40,6 +40,9 @@ impl AppConfig {
         config.asr.openai_realtime.base_url =
             openai_realtime_base_url(&config.asr.openai_realtime.base_url);
         config.voice.validate()?;
+        if config.mcp.home_assistant.enabled {
+            config.mcp.home_assistant.validated_timeout_duration()?;
+        }
         Ok(config)
     }
 
@@ -85,6 +88,9 @@ pub struct QwenRealtimeConfig {
     pub output_sample_rate: SampleRate,
     pub connect_timeout_s: f64,
     pub event_timeout_s: f64,
+    pub tool_timeout_s: f64,
+    pub max_tool_calls: usize,
+    pub max_tool_iterations: usize,
 }
 
 impl Default for QwenRealtimeConfig {
@@ -100,6 +106,9 @@ impl Default for QwenRealtimeConfig {
             output_sample_rate: SampleRate(24_000),
             connect_timeout_s: 10.0,
             event_timeout_s: 30.0,
+            tool_timeout_s: 10.0,
+            max_tool_calls: 8,
+            max_tool_iterations: 4,
         }
     }
 }
@@ -131,6 +140,12 @@ impl QwenRealtimeConfig {
         if !self.event_timeout_s.is_finite() || self.event_timeout_s <= 0.0 {
             return Err(RealtimeVoiceConfigError::InvalidEventTimeout);
         }
+        if !self.tool_timeout_s.is_finite() || self.tool_timeout_s <= 0.0 {
+            return Err(RealtimeVoiceConfigError::InvalidToolTimeout);
+        }
+        if self.max_tool_calls == 0 || self.max_tool_iterations == 0 {
+            return Err(RealtimeVoiceConfigError::InvalidToolLimit);
+        }
         if enabled && (self.api_key.trim().is_empty() || self.api_key == "EMPTY") {
             return Err(RealtimeVoiceConfigError::MissingApiKey);
         }
@@ -154,6 +169,10 @@ pub enum RealtimeVoiceConfigError {
     InvalidConnectTimeout,
     #[error("voice.qwen.event_timeout_s must be finite and greater than zero")]
     InvalidEventTimeout,
+    #[error("voice.qwen.tool_timeout_s must be finite and greater than zero")]
+    InvalidToolTimeout,
+    #[error("voice.qwen max_tool_calls and max_tool_iterations must be greater than zero")]
+    InvalidToolLimit,
     #[error("voice.qwen.api_key is required when voice.runtime is native_qwen")]
     MissingApiKey,
 }
@@ -514,6 +533,23 @@ impl Default for HomeAssistantMcpConfig {
     }
 }
 
+impl HomeAssistantMcpConfig {
+    pub(crate) fn validated_timeout_duration(&self) -> anyhow::Result<Duration> {
+        anyhow::ensure!(
+            self.timeout_s.is_finite() && self.timeout_s > 0.0,
+            "mcp.home_assistant.timeout_s must be finite and greater than zero"
+        );
+        let timeout = Duration::try_from_secs_f64(self.timeout_s).map_err(|_| {
+            anyhow::anyhow!("mcp.home_assistant.timeout_s is too large to represent as a duration")
+        })?;
+        anyhow::ensure!(
+            tokio::time::Instant::now().checked_add(timeout).is_some(),
+            "mcp.home_assistant.timeout_s is too large to use as a Tokio deadline"
+        );
+        Ok(timeout)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MusicConfig {
@@ -709,9 +745,23 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{
-        AsrConfig, AsrProvider, RealtimeVoiceConfig, RealtimeVoiceConfigError, VoiceRuntime,
+        AppConfig, AsrConfig, AsrProvider, RealtimeVoiceConfig, RealtimeVoiceConfigError,
+        VoiceRuntime,
     };
+
+    fn load_config(yaml: &str, label: &str) -> anyhow::Result<AppConfig> {
+        let path = std::env::temp_dir().join(format!(
+            "xiaoai-agent-config-{}-{label}.yaml",
+            std::process::id()
+        ));
+        fs::write(&path, yaml).expect("failed to write temporary config");
+        let result = AppConfig::load(&path);
+        fs::remove_file(path).expect("failed to remove temporary config");
+        result
+    }
 
     #[test]
     fn parses_openai_realtime_provider_alias() {
@@ -745,5 +795,88 @@ mod tests {
             config.validate(),
             Err(RealtimeVoiceConfigError::InvalidInputSampleRate(24_000))
         );
+    }
+
+    #[test]
+    fn parses_and_validates_native_tool_limits() {
+        let config: RealtimeVoiceConfig = serde_yaml::from_str(
+            "runtime: native_qwen\nqwen:\n  api_key: test\n  tool_timeout_s: 2.5\n  max_tool_calls: 3\n  max_tool_iterations: 2\n",
+        )
+        .unwrap();
+        assert_eq!(config.qwen.tool_timeout_s, 2.5);
+        assert_eq!(config.qwen.max_tool_calls, 3);
+        assert_eq!(config.qwen.max_tool_iterations, 2);
+        assert_eq!(config.validate(), Ok(()));
+
+        for yaml in [
+            "qwen:\n  tool_timeout_s: 0\n",
+            "qwen:\n  max_tool_calls: 0\n",
+            "qwen:\n  max_tool_iterations: 0\n",
+        ] {
+            let invalid: RealtimeVoiceConfig = serde_yaml::from_str(yaml).unwrap();
+            assert!(
+                invalid.validate().is_err(),
+                "accepted invalid config: {yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_mcp_rejects_non_positive_and_non_finite_timeout() {
+        for (label, timeout) in [
+            ("zero", "0"),
+            ("negative", "-1"),
+            ("positive-infinity", ".inf"),
+            ("negative-infinity", "-.inf"),
+            ("nan", ".nan"),
+        ] {
+            let yaml =
+                format!("mcp:\n  home_assistant:\n    enabled: true\n    timeout_s: {timeout}\n");
+            let error = load_config(&yaml, label).expect_err("invalid MCP timeout accepted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("mcp.home_assistant.timeout_s must be finite and greater than zero"),
+                "unclear native MCP timeout error for {timeout}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_mcp_rejects_timeout_too_large_for_tokio_deadline() {
+        let timeout = 1.0e19;
+        assert!(
+            std::time::Duration::try_from_secs_f64(timeout).is_ok(),
+            "regression value must remain representable as Duration"
+        );
+        let yaml =
+            format!("mcp:\n  home_assistant:\n    enabled: true\n    timeout_s: {timeout:.1e}\n");
+        let error = load_config(&yaml, "tokio-deadline-overflow")
+            .expect_err("MCP timeout that overflows a Tokio deadline was accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("mcp.home_assistant.timeout_s is too large to use as a Tokio deadline"),
+            "unclear native MCP deadline overflow error: {error}"
+        );
+    }
+
+    #[test]
+    fn enabled_mcp_accepts_valid_timeout_and_legacy_defaults_stay_unchanged() {
+        let native = "voice:\n  runtime: native_qwen\n  qwen:\n    api_key: test\nmcp:\n  home_assistant:\n    enabled: true\n    timeout_s: 0.25\n";
+        assert_eq!(
+            load_config(native, "valid-native")
+                .expect("valid native MCP timeout rejected")
+                .mcp
+                .home_assistant
+                .timeout_s,
+            0.25
+        );
+
+        let legacy = "mcp:\n  home_assistant:\n    enabled: true\n    timeout_s: 5\n";
+        let legacy =
+            load_config(legacy, "valid-legacy").expect("valid legacy MCP timeout rejected");
+        assert_eq!(legacy.voice.runtime, VoiceRuntime::Legacy);
+        assert_eq!(legacy.mcp.home_assistant.timeout_s, 5.0);
     }
 }

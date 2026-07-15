@@ -44,6 +44,27 @@ capture:
   max_utterance_s: 15.0
   cooldown_s: 0.7
 
+voice:
+  # legacy keeps the ASR -> text Agent -> device TTS pipeline below.
+  # native_qwen streams microphone/audio directly to Qwen Realtime and lets it call
+  # the same built-in and MCP tools registered with the text Agent.
+  runtime: legacy
+  qwen:
+    url: wss://dashscope.aliyuncs.com/api-ws/v1/realtime
+    api_key: EMPTY
+    model: qwen3.5-omni-plus-realtime
+    voice: Cherry
+    input_audio_format: pcm
+    output_audio_format: pcm
+    input_sample_rate: 16000
+    output_sample_rate: 24000
+    connect_timeout_s: 10
+    event_timeout_s: 30
+    # Native tool calls are cancellable, individually timed out, and bounded per turn.
+    tool_timeout_s: 10
+    max_tool_calls: 8
+    max_tool_iterations: 4
+
 asr:
   # open_ai, openai_realtime, or xiaomi_aivs
   provider: xiaomi_aivs
@@ -114,6 +135,7 @@ mcp:
     enabled: false
     url: http://homeassistant.local:8123/mcp_server/sse
     token: ""
+    # Also bounds native-Qwen MCP tool discovery and list refresh.
     timeout_s: 5
 
 music:
