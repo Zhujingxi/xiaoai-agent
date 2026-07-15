@@ -1,7 +1,25 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
+use tokio::sync::{Mutex, MutexGuard};
 
 const MAX_SECRET_CHARS: usize = 4096;
+const VALIDATION_PATHS: &[&str] = &[
+    "voice.qwen.api_key",
+    "voice.qwen.url",
+    "voice.qwen.input_sample_rate",
+    "voice.qwen.output_sample_rate",
+    "voice.qwen.connect_timeout_s",
+    "voice.qwen.event_timeout_s",
+    "voice.qwen.tool_timeout_s",
+    "mcp.home_assistant.timeout_s",
+];
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SecretStatus {
@@ -599,6 +617,348 @@ impl ConfigResponse {
     }
 }
 
+pub struct ConfigStore {
+    path: PathBuf,
+    operation: Mutex<()>,
+    restart_required: Arc<AtomicBool>,
+}
+
+impl ConfigStore {
+    pub fn new(path: PathBuf, restart_required: Arc<AtomicBool>) -> Self {
+        Self {
+            path,
+            operation: Mutex::new(()),
+            restart_required,
+        }
+    }
+
+    pub fn restart_required_flag(&self) -> Arc<AtomicBool> {
+        self.restart_required.clone()
+    }
+
+    pub async fn operation_lock(&self) -> MutexGuard<'_, ()> {
+        self.operation.lock().await
+    }
+
+    pub async fn load(&self) -> Result<ConfigResponse, ConfigStoreError> {
+        let _guard = self.operation.lock().await;
+        self.load_locked()
+    }
+
+    pub async fn save(
+        &self,
+        update: EditableConfig<SecretUpdate>,
+    ) -> Result<ConfigResponse, ConfigStoreError> {
+        let _guard = self.operation.lock().await;
+        self.save_locked(update)
+    }
+
+    fn load_locked(&self) -> Result<ConfigResponse, ConfigStoreError> {
+        let app = crate::config::AppConfig::load(&self.path).map_err(map_app_config_error)?;
+        Ok(self.response_from_app(&app))
+    }
+
+    fn save_locked(
+        &self,
+        update: EditableConfig<SecretUpdate>,
+    ) -> Result<ConfigResponse, ConfigStoreError> {
+        validate_update(&update)?;
+
+        let current_text = std::fs::read_to_string(&self.path)?;
+        let mut candidate_yaml: Value = serde_yaml::from_str(&current_text)?;
+        apply_update_to_yaml(&mut candidate_yaml, &update)?;
+        let candidate_text = serde_yaml::to_string(&candidate_yaml)?;
+
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_path = parent.join(format!(
+            ".agent.yaml.tmp-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let result = (|| {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut temp_file = options.open(&temp_path)?;
+            temp_file.write_all(candidate_text.as_bytes())?;
+            temp_file.sync_all()?;
+            drop(temp_file);
+
+            let candidate =
+                crate::config::AppConfig::load(&temp_path).map_err(map_app_config_error)?;
+            let backup = self.path.with_file_name(format!(
+                "{}.bak",
+                self.path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("agent.yaml")
+            ));
+            std::fs::copy(&self.path, &backup)?;
+            replace_formal_file(&temp_path, &self.path)?;
+            Ok(candidate)
+        })();
+
+        let candidate = match result {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(error);
+            }
+        };
+
+        self.restart_required.store(true, Ordering::SeqCst);
+        Ok(self.response_from_app(&candidate))
+    }
+
+    fn response_from_app(&self, app: &crate::config::AppConfig) -> ConfigResponse {
+        ConfigResponse {
+            editable: EditableConfig::<SecretStatus>::from_app(app),
+            advanced: ConfigResponse::advanced_from_app(app),
+            restart_required: self.restart_required.load(Ordering::SeqCst),
+        }
+    }
+}
+
+fn map_app_config_error(error: anyhow::Error) -> ConfigStoreError {
+    let message = format!("{error:#}");
+    let field = VALIDATION_PATHS
+        .iter()
+        .find(|path| message.contains(**path))
+        .map(|path| (*path).to_string());
+
+    let error = match error.downcast::<std::io::Error>() {
+        Ok(error) => return ConfigStoreError::Io(error),
+        Err(error) => error,
+    };
+    match error.downcast::<serde_yaml::Error>() {
+        Ok(error) => ConfigStoreError::Yaml(error),
+        Err(_) => ConfigStoreError::Validation { field, message },
+    }
+}
+
+fn invalid_field(field: &str, message: impl Into<String>) -> ConfigStoreError {
+    ConfigStoreError::Field {
+        field: field.to_string(),
+        message: message.into(),
+    }
+}
+
+fn validate_update(update: &EditableConfig<SecretUpdate>) -> Result<(), ConfigStoreError> {
+    if !matches!(update.voice.runtime.as_str(), "legacy" | "native_qwen") {
+        return Err(invalid_field(
+            "voice.runtime",
+            "must be legacy or native_qwen",
+        ));
+    }
+    if !matches!(
+        update.asr.provider.as_str(),
+        "open_ai" | "openai_realtime" | "xiaomi_aivs"
+    ) {
+        return Err(invalid_field("asr.provider", "unsupported ASR provider"));
+    }
+    if !matches!(update.music.provider.as_str(), "navidrome" | "netease") {
+        return Err(invalid_field(
+            "music.provider",
+            "must be navidrome or netease",
+        ));
+    }
+    validate_positive_timeout(
+        "runtime.session_idle_timeout_s",
+        update.runtime.session_idle_timeout_s,
+    )?;
+
+    for (field, value) in [
+        (
+            "voice.qwen.connect_timeout_s",
+            update.voice.qwen.connect_timeout_s,
+        ),
+        (
+            "voice.qwen.event_timeout_s",
+            update.voice.qwen.event_timeout_s,
+        ),
+        (
+            "voice.qwen.tool_timeout_s",
+            update.voice.qwen.tool_timeout_s,
+        ),
+        ("asr.open_ai.timeout_s", update.asr.open_ai.timeout_s),
+        (
+            "asr.openai_realtime.timeout_s",
+            update.asr.openai_realtime.timeout_s,
+        ),
+        ("llm.timeout_s", update.llm.timeout_s),
+        ("agent.weather.timeout_s", update.agent.weather.timeout_s),
+        (
+            "agent.web_search.timeout_s",
+            update.agent.web_search.timeout_s,
+        ),
+        (
+            "mcp.home_assistant.timeout_s",
+            update.home_assistant.timeout_s,
+        ),
+        (
+            "music.navidrome.timeout_s",
+            update.music.navidrome.timeout_s,
+        ),
+        ("music.netease.timeout_s", update.music.netease.timeout_s),
+    ] {
+        validate_positive_timeout(field, value)?;
+    }
+
+    if !(1..=10).contains(&update.agent.web_search.max_results) {
+        return Err(invalid_field(
+            "agent.web_search.max_results",
+            "must be between 1 and 10",
+        ));
+    }
+    if update.airplay.port == 0 {
+        return Err(invalid_field("airplay.port", "must be greater than zero"));
+    }
+    if !update.airplay.duck_gain.is_finite() || !(0.0..=1.0).contains(&update.airplay.duck_gain) {
+        return Err(invalid_field(
+            "airplay.interruption.duck_gain",
+            "must be finite and between 0 and 1",
+        ));
+    }
+
+    for value in &update.runtime.acknowledge_text {
+        validate_string("runtime.acknowledge_text", value)?;
+    }
+    for (field, value) in [
+        ("voice.runtime", update.voice.runtime.as_str()),
+        ("voice.qwen.url", update.voice.qwen.url.as_str()),
+        ("voice.qwen.model", update.voice.qwen.model.as_str()),
+        ("voice.qwen.voice", update.voice.qwen.voice.as_str()),
+        ("asr.provider", update.asr.provider.as_str()),
+        ("asr.open_ai.base_url", update.asr.open_ai.base_url.as_str()),
+        ("asr.open_ai.model", update.asr.open_ai.model.as_str()),
+        ("asr.open_ai.language", update.asr.open_ai.language.as_str()),
+        ("asr.open_ai.prompt", update.asr.open_ai.prompt.as_str()),
+        (
+            "asr.openai_realtime.base_url",
+            update.asr.openai_realtime.base_url.as_str(),
+        ),
+        (
+            "asr.openai_realtime.model",
+            update.asr.openai_realtime.model.as_str(),
+        ),
+        ("llm.base_url", update.llm.base_url.as_str()),
+        ("llm.model", update.llm.model.as_str()),
+        ("agent.timezone", update.agent.timezone.as_str()),
+        (
+            "agent.weather.default_location",
+            update.agent.weather.default_location.as_str(),
+        ),
+        (
+            "agent.weather.ip_lookup_url",
+            update.agent.weather.ip_lookup_url.as_str(),
+        ),
+        (
+            "agent.web_search.tavily_url",
+            update.agent.web_search.tavily_url.as_str(),
+        ),
+        (
+            "agent.web_search.search_depth",
+            update.agent.web_search.search_depth.as_str(),
+        ),
+        ("mcp.home_assistant.url", update.home_assistant.url.as_str()),
+        ("music.provider", update.music.provider.as_str()),
+        (
+            "music.interruption.mode",
+            update.music.interruption_mode.as_str(),
+        ),
+        (
+            "music.navidrome.base_url",
+            update.music.navidrome.base_url.as_str(),
+        ),
+        (
+            "music.navidrome.username",
+            update.music.navidrome.username.as_str(),
+        ),
+        (
+            "music.navidrome.api_version",
+            update.music.navidrome.api_version.as_str(),
+        ),
+        (
+            "music.netease.api_base_url",
+            update.music.netease.api_base_url.as_str(),
+        ),
+        (
+            "music.netease.login_mode",
+            update.music.netease.login_mode.as_str(),
+        ),
+        (
+            "music.netease.account",
+            update.music.netease.account.as_str(),
+        ),
+        ("music.netease.phone", update.music.netease.phone.as_str()),
+        (
+            "music.netease.default_level",
+            update.music.netease.default_level.as_str(),
+        ),
+        ("airplay.name", update.airplay.name.as_str()),
+        (
+            "airplay.interruption.mode",
+            update.airplay.interruption_mode.as_str(),
+        ),
+    ] {
+        validate_string(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_positive_timeout(field: &str, value: f64) -> Result<(), ConfigStoreError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(invalid_field(field, "must be finite and greater than zero"));
+    }
+    Ok(())
+}
+
+fn validate_string(field: &str, value: &str) -> Result<(), ConfigStoreError> {
+    if value.chars().count() > MAX_SECRET_CHARS {
+        return Err(invalid_field(field, "must not exceed 4096 characters"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_formal_file(temp_path: &Path, formal_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, formal_path)
+}
+
+#[cfg(windows)]
+fn replace_formal_file(temp_path: &Path, formal_path: &Path) -> std::io::Result<()> {
+    let old_path = formal_path.with_file_name(format!(
+        "{}.replace-old",
+        formal_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("agent.yaml")
+    ));
+    std::fs::rename(formal_path, &old_path)?;
+    if let Err(replace_error) = std::fs::rename(temp_path, formal_path) {
+        return match std::fs::rename(&old_path, formal_path) {
+            Ok(()) => Err(replace_error),
+            Err(restore_error) => Err(std::io::Error::new(
+                restore_error.kind(),
+                format!(
+                    "configuration replacement failed ({replace_error}); restoring the formal file failed ({restore_error})"
+                ),
+            )),
+        };
+    }
+    std::fs::remove_file(old_path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_formal_file(temp_path: &Path, formal_path: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp_path, formal_path)
+}
+
 pub fn apply_update_to_yaml(
     root: &mut Value,
     update: &EditableConfig<SecretUpdate>,
@@ -851,6 +1211,10 @@ pub fn apply_update_to_yaml(
 mod tests {
     use super::*;
 
+    fn example_config_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("agent.example.yaml")
+    }
+
     fn yaml_string<'a>(root: &'a serde_yaml::Value, path: &[&str]) -> &'a str {
         yaml_value(root, path).as_str().unwrap()
     }
@@ -1097,5 +1461,160 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[tokio::test]
+    async fn save_creates_backup_and_preserves_hidden_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::copy(example_config_path(), &path).unwrap();
+        let restart_required = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = ConfigStore::new(path.clone(), restart_required.clone());
+        assert!(std::sync::Arc::ptr_eq(
+            &store.restart_required_flag(),
+            &restart_required
+        ));
+        drop(store.operation_lock().await);
+        let mut update = store
+            .load()
+            .await
+            .unwrap()
+            .editable
+            .into_update_keep_secrets();
+        update.llm.model = "test-model".to_string();
+
+        let saved = store.save(update).await.unwrap();
+
+        assert_eq!(saved.editable.llm.model, "test-model");
+        assert!(saved.restart_required);
+        assert!(restart_required.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(path.with_file_name("agent.yaml.bak").exists());
+        let current: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let backup: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(path.with_file_name("agent.yaml.bak")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(yaml_string(&current, &["llm", "model"]), "test-model");
+        assert_ne!(yaml_string(&backup, &["llm", "model"]), "test-model");
+        assert_eq!(
+            yaml_string(&current, &["device", "tts_command"]),
+            yaml_string(&backup, &["device", "tts_command"]),
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_native_qwen_config_never_replaces_formal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::copy(example_config_path(), &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let store = ConfigStore::new(path.clone(), Default::default());
+        let mut update = store
+            .load()
+            .await
+            .unwrap()
+            .editable
+            .into_update_keep_secrets();
+        update.voice.runtime = "native_qwen".to_string();
+        update.voice.qwen.api_key = SecretUpdate {
+            mode: SecretMode::Clear,
+            value: None,
+        };
+
+        let error = store.save(update).await.unwrap_err();
+
+        assert_eq!(error.field(), Some("voice.qwen.api_key"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(!path.with_file_name("agent.yaml.bak").exists());
+    }
+
+    #[tokio::test]
+    async fn save_backup_failure_never_replaces_formal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::copy(example_config_path(), &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::create_dir(path.with_file_name("agent.yaml.bak")).unwrap();
+        let store = ConfigStore::new(path.clone(), Default::default());
+        let mut update = store
+            .load()
+            .await
+            .unwrap()
+            .editable
+            .into_update_keep_secrets();
+        update.llm.model = "test-model".to_string();
+
+        let error = store.save(update).await.unwrap_err();
+
+        assert!(matches!(error, ConfigStoreError::Io(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_invalid_payload_fields_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::copy(example_config_path(), &path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let store = ConfigStore::new(path.clone(), Default::default());
+
+        macro_rules! assert_invalid {
+            ($field:literal, $change:expr) => {{
+                let mut update = store
+                    .load()
+                    .await
+                    .unwrap()
+                    .editable
+                    .into_update_keep_secrets();
+                $change(&mut update);
+                let error = store.save(update).await.unwrap_err();
+                assert_eq!(error.field(), Some($field));
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert!(!path.with_file_name("agent.yaml.bak").exists());
+            }};
+        }
+
+        assert_invalid!("voice.runtime", |update: &mut EditableConfig<
+            SecretUpdate,
+        >| update.voice.runtime =
+            "other".to_string());
+        assert_invalid!("asr.provider", |update: &mut EditableConfig<
+            SecretUpdate,
+        >| update.asr.provider =
+            "other".to_string());
+        assert_invalid!("music.provider", |update: &mut EditableConfig<
+            SecretUpdate,
+        >| update.music.provider =
+            "other".to_string());
+        assert_invalid!(
+            "runtime.session_idle_timeout_s",
+            |update: &mut EditableConfig<SecretUpdate>| update.runtime.session_idle_timeout_s = 0.0
+        );
+        assert_invalid!(
+            "voice.qwen.connect_timeout_s",
+            |update: &mut EditableConfig<SecretUpdate>| update.voice.qwen.connect_timeout_s = 0.0
+        );
+        assert_invalid!("asr.open_ai.timeout_s", |update: &mut EditableConfig<
+            SecretUpdate,
+        >| update
+            .asr
+            .open_ai
+            .timeout_s =
+            f64::NAN);
+        assert_invalid!(
+            "agent.web_search.max_results",
+            |update: &mut EditableConfig<SecretUpdate>| update.agent.web_search.max_results = 11
+        );
+        assert_invalid!("airplay.port", |update: &mut EditableConfig<
+            SecretUpdate,
+        >| update.airplay.port = 0);
+        assert_invalid!(
+            "airplay.interruption.duck_gain",
+            |update: &mut EditableConfig<SecretUpdate>| update.airplay.duck_gain = 1.1
+        );
+        assert_invalid!("llm.model", |update: &mut EditableConfig<SecretUpdate>| {
+            update.llm.model = "x".repeat(4097)
+        });
     }
 }
