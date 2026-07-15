@@ -6,7 +6,11 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::MutexGuard;
+
+use super::restart::{RestartController, RestartError};
 
 const MAX_SECRET_CHARS: usize = 4096;
 const VALIDATION_PATHS: &[&str] = &[
@@ -45,6 +49,8 @@ pub struct SecretUpdate {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigStoreError {
+    #[error("configuration save rejected because restart is in progress")]
+    RestartInProgress,
     #[error("invalid configuration field {field}: {message}")]
     Field { field: String, message: String },
     #[error("configuration validation failed: {message}")]
@@ -620,15 +626,20 @@ impl ConfigResponse {
 
 pub struct ConfigStore {
     path: PathBuf,
-    operation: Mutex<()>,
+    operation: Mutex<OperationState>,
     restart_required: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+pub(crate) struct OperationState {
+    restart_scheduled: bool,
 }
 
 impl ConfigStore {
     pub fn new(path: PathBuf, restart_required: Arc<AtomicBool>) -> Self {
         Self {
             path,
-            operation: Mutex::new(()),
+            operation: Mutex::new(OperationState::default()),
             restart_required,
         }
     }
@@ -638,8 +649,22 @@ impl ConfigStore {
         self.restart_required.clone()
     }
 
-    pub async fn operation_lock(&self) -> MutexGuard<'_, ()> {
+    #[cfg(test)]
+    pub(crate) async fn operation_lock(&self) -> MutexGuard<'_, OperationState> {
         self.operation.lock().await
+    }
+
+    pub async fn schedule_restart(
+        &self,
+        restarter: &dyn RestartController,
+    ) -> Result<(), RestartError> {
+        let mut operation = self.operation.lock().await;
+        if operation.restart_scheduled {
+            return Err(RestartError::AlreadyScheduled);
+        }
+        restarter.schedule_restart()?;
+        operation.restart_scheduled = true;
+        Ok(())
     }
 
     pub async fn load(&self) -> Result<ConfigResponse, ConfigStoreError> {
@@ -651,7 +676,10 @@ impl ConfigStore {
         &self,
         update: EditableConfig<SecretUpdate>,
     ) -> Result<ConfigResponse, ConfigStoreError> {
-        let _guard = self.operation.lock().await;
+        let operation = self.operation.lock().await;
+        if operation.restart_scheduled {
+            return Err(ConfigStoreError::RestartInProgress);
+        }
         self.save_locked(update)
     }
 

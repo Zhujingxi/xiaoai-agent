@@ -33,10 +33,10 @@ impl ApiError {
     }
 
     fn invalid_request(status: StatusCode) -> Self {
-        let error = if status == StatusCode::PAYLOAD_TOO_LARGE {
-            "payload_too_large"
+        let (status, error) = if status == StatusCode::PAYLOAD_TOO_LARGE {
+            (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
         } else {
-            "invalid_request"
+            (StatusCode::BAD_REQUEST, "invalid_request")
         };
         Self::new(status, error, None)
     }
@@ -51,6 +51,9 @@ impl IntoResponse for ApiError {
 impl From<ConfigStoreError> for ApiError {
     fn from(error: ConfigStoreError) -> Self {
         match error {
+            ConfigStoreError::RestartInProgress => {
+                Self::new(StatusCode::CONFLICT, "restart_in_progress", None)
+            }
             ConfigStoreError::Field { field, .. } => {
                 Self::new(StatusCode::BAD_REQUEST, "invalid_config", Some(field))
             }
@@ -97,6 +100,10 @@ struct LogsResponse {
 struct RestartResponse {
     restarting: bool,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestartRequest {}
 
 pub fn router(state: WebState) -> Router {
     Router::new()
@@ -147,9 +154,15 @@ async fn get_logs(
     }))
 }
 
-async fn restart(State(state): State<WebState>) -> Result<impl IntoResponse, ApiError> {
-    let _guard = state.store.operation_lock().await;
-    state.restarter.schedule_restart()?;
+async fn restart(
+    State(state): State<WebState>,
+    payload: Result<Json<RestartRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(_request) = payload.map_err(|error| ApiError::invalid_request(error.status()))?;
+    state
+        .store
+        .schedule_restart(state.restarter.as_ref())
+        .await?;
     tracing::info!(target: "xiaoai_agent::web_status", "restart scheduled");
     Ok((
         StatusCode::ACCEPTED,
@@ -184,6 +197,8 @@ mod tests {
     use crate::web::status::{LogBuffer, RuntimeStatus};
     use crate::web::WebState;
 
+    static MUTATION_EVENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct MockRestarter {
         calls: Arc<AtomicUsize>,
     }
@@ -192,6 +207,16 @@ mod tests {
         fn schedule_restart(&self) -> Result<(), RestartError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    struct FailingRestarter;
+
+    impl RestartController for FailingRestarter {
+        fn schedule_restart(&self) -> Result<(), RestartError> {
+            Err(RestartError::Spawn(std::io::Error::other(
+                "deterministic test failure",
+            )))
         }
     }
 
@@ -274,6 +299,38 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn config_update_body(fixture: &TestFixture, model: &str) -> String {
+        let response = fixture.store.load().await.unwrap();
+        let mut editable = serde_json::to_value(response.editable).unwrap();
+        editable["llm"]["model"] = Value::String(model.to_string());
+        for path in [
+            "/voice/qwen/api_key",
+            "/asr/open_ai/api_key",
+            "/asr/openai_realtime/api_key",
+            "/llm/api_key",
+            "/agent/weather/qweather_url",
+            "/agent/web_search/api_key",
+            "/home_assistant/token",
+            "/music/navidrome/password",
+            "/music/netease/password",
+            "/music/netease/md5_password",
+            "/airplay/password",
+        ] {
+            *editable.pointer_mut(path).unwrap() =
+                serde_json::json!({"mode": "keep", "value": null});
+        }
+        serde_json::to_string(&editable).unwrap()
+    }
+
+    fn directory_entries(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut entries = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
     #[tokio::test]
     async fn index_serves_the_configuration_page() {
         let (app, _fixture) = test_router("").await;
@@ -334,6 +391,59 @@ mod tests {
         for forbidden in ["react", "vue", "bootstrap", "tailwind", "websocket"] {
             assert!(!body.to_ascii_lowercase().contains(forbidden));
         }
+        for marker in [
+            "pageState.dirty",
+            "markDirty",
+            "normalizeFieldPath",
+            "showFieldError",
+            "clearFieldErrors",
+            "aria-invalid",
+            "aria-describedby",
+            "未保存",
+            r#"id="qwen-url" type="url" required pattern="wss://.*""#,
+            r#"id="weather-ip-url" type="url""#,
+            r#"id="ha-url" type="url""#,
+            r#"id="search-results" type="number" min="1" max="10" step="1""#,
+            r#"id="airplay-port" type="number" min="1" max="65535" step="1""#,
+            r#"id="airplay-gain" type="number" min="0" max="1" step="any""#,
+        ] {
+            assert!(
+                body.contains(marker),
+                "missing final-review marker: {marker}"
+            );
+        }
+        assert!(!body.contains("innerHTML"));
+
+        let restart_script = body
+            .split("async function restartAgent()")
+            .nth(1)
+            .unwrap()
+            .split("async function refreshStatus()")
+            .next()
+            .unwrap();
+        let baseline = restart_script
+            .find(r#"const baseline = await requestJson("/api/status""#)
+            .expect("restart must fetch a fresh status baseline");
+        let post = restart_script
+            .find(r#"requestJson("/api/restart""#)
+            .expect("restart must post after the baseline");
+        assert!(baseline < post);
+        assert!(!restart_script.contains("let before = pageState.status"));
+
+        let stylesheet = body
+            .split("<style>")
+            .nth(1)
+            .unwrap()
+            .split("</style>")
+            .next()
+            .unwrap();
+        assert!(
+            stylesheet
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+                < 220
+        );
     }
 
     #[tokio::test]
@@ -404,6 +514,7 @@ airplay:
 
     #[tokio::test]
     async fn restart_returns_accepted_and_calls_controller_once() {
+        let _event_guard = MUTATION_EVENT_TEST_LOCK.lock().await;
         let (app, fixture) = test_router("").await;
         let response = app
             .oneshot(
@@ -426,7 +537,163 @@ airplay:
     }
 
     #[tokio::test]
+    async fn restart_rejects_invalid_json_requests_without_calling_controller() {
+        let (app, fixture) = test_router("").await;
+        let cases = [
+            (None, "{}"),
+            (Some("text/plain"), "{}"),
+            (Some("application/json"), "{"),
+            (Some("application/json"), r#"{"unexpected":true}"#),
+        ];
+
+        for (content_type, body) in cases {
+            let mut request = Request::builder().method("POST").uri("/api/restart");
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body)).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response_json(response).await,
+                serde_json::json!({"error": "invalid_request", "field": null})
+            );
+        }
+        assert_eq!(fixture.restart_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn restart_body_over_64_kib_is_rejected_without_calling_controller() {
+        let (app, fixture) = test_router("").await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/restart")
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![b' '; 65 * 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({"error": "payload_too_large", "field": null})
+        );
+        assert_eq!(fixture.restart_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_restart_schedule_rejects_later_save_without_touching_disk() {
+        let _event_guard = MUTATION_EVENT_TEST_LOCK.lock().await;
+        let (app, fixture) = test_router("").await;
+        let original = std::fs::read(&fixture.config_path).unwrap();
+        let parent = fixture.config_path.parent().unwrap();
+        let entries_before = directory_entries(parent);
+
+        let restart = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/restart")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restart.status(), StatusCode::ACCEPTED);
+
+        let save = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        config_update_body(&fixture, "must-not-save").await,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(save.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(save).await,
+            serde_json::json!({"error": "restart_in_progress", "field": null})
+        );
+        assert_eq!(fixture.restart_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&fixture.config_path).unwrap(), original);
+        assert_eq!(directory_entries(parent), entries_before);
+    }
+
+    #[tokio::test]
+    async fn duplicate_restart_is_rejected_without_recalling_controller() {
+        let _event_guard = MUTATION_EVENT_TEST_LOCK.lock().await;
+        let (app, fixture) = test_router("").await;
+        for expected in [StatusCode::ACCEPTED, StatusCode::CONFLICT] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/restart")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert_eq!(fixture.restart_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_restart_schedule_does_not_close_the_save_gate() {
+        let (_app, fixture) = test_router("").await;
+        let app = router(WebState {
+            restarter: Arc::new(FailingRestarter),
+            ..fixture.state.clone()
+        });
+
+        let restart = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/restart")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restart.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let mut update = crate::web::config_store::EditableConfig::from_app(
+            &AppConfig::load(&fixture.config_path).unwrap(),
+        )
+        .into_update_keep_secrets();
+        update.llm.model = "allowed-save".to_string();
+        fixture.store.save(update).await.unwrap();
+        assert_eq!(
+            AppConfig::load(&fixture.config_path).unwrap().llm.model,
+            "allowed-save"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn successful_mutations_emit_only_fixed_safe_status_events() {
+        let _event_guard = MUTATION_EVENT_TEST_LOCK.lock().await;
         let (_app, fixture) = test_router("").await;
         let private_request_value = "private-request-value-must-not-be-logged";
         let mut update = crate::web::config_store::EditableConfig::from_app(
@@ -453,21 +720,24 @@ airplay:
         )
         .await
         .is_ok());
-        assert!(super::restart(axum::extract::State(fixture.state.clone()))
-            .await
-            .is_ok());
+        assert!(super::restart(
+            axum::extract::State(fixture.state.clone()),
+            Ok(axum::Json(super::RestartRequest {})),
+        )
+        .await
+        .is_ok());
 
         let entries = event_logs.entries(10);
-        assert_eq!(entries.len(), 2);
-        assert!(entries[0].contains("configuration saved"));
-        assert!(entries[1].contains("restart scheduled"));
         let combined = entries.join("\n");
+        assert!(combined.contains("configuration saved"), "{entries:?}");
+        assert!(combined.contains("restart scheduled"), "{entries:?}");
         assert!(!combined.contains(private_request_value));
         assert!(!combined.contains(&fixture.config_path.display().to_string()));
     }
 
     #[tokio::test]
     async fn restart_waits_for_the_config_operation_lock() {
+        let _event_guard = MUTATION_EVENT_TEST_LOCK.lock().await;
         let (app, fixture) = test_router("").await;
         let guard = fixture.store.operation_lock().await;
         let mut pending = Box::pin(

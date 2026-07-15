@@ -77,6 +77,7 @@
     }
     textarea { min-height: 96px; resize: vertical; }
     input:disabled, select:disabled, textarea:disabled { background: var(--soft); }
+    [aria-invalid="true"] { border-color: var(--red); }
     .check-field { display: grid; grid-template-columns: 24px 1fr; align-items: start; gap: 8px; padding-top: 7px; }
     .check-field input { width: 20px; min-height: 20px; margin: 2px 0 0; }
     .check-field label { margin: 0; }
@@ -85,6 +86,8 @@
     .provider-panel { margin-top: 18px; padding-left: 16px; border-left: 3px solid var(--border); }
     .provider-panel h3 { margin: 0; font-size: 1rem; }
     .helper { margin: 6px 0 0; color: var(--muted); font-size: .875rem; }
+    .field-error { margin: 6px 0 0; color: var(--red); font-size: .875rem; }
+    .check-field .field-error { grid-column: 1 / -1; }
     .status-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; margin: 0; border-top: 1px solid var(--border); }
     .status-list div { padding: 12px 0; border-bottom: 1px solid var(--border); }
     .status-list dt { color: var(--muted); font-size: .875rem; }
@@ -161,15 +164,15 @@
         <div class="provider-panel" data-provider-section="native_qwen" hidden>
           <h3>Qwen 实时语音</h3>
           <div class="fields">
-            <div class="field span-2"><label for="qwen-url">服务 URL</label><input id="qwen-url" data-path="voice.qwen.url"></div>
+            <div class="field span-2"><label for="qwen-url">服务 URL</label><input id="qwen-url" type="url" required pattern="wss://.*" data-path="voice.qwen.url"></div>
             <div class="field span-2"><label for="qwen-key">API 密钥</label><div class="secret-row"><input id="qwen-key" type="password" autocomplete="new-password" data-secret-path="voice.qwen.api_key"><button class="danger" type="button" data-clear-secret="voice.qwen.api_key" aria-label="清除 Qwen API 密钥">清除</button></div></div>
-            <div class="field"><label for="qwen-model">模型</label><input id="qwen-model" data-path="voice.qwen.model"></div>
-            <div class="field"><label for="qwen-voice">音色</label><input id="qwen-voice" data-path="voice.qwen.voice"></div>
-            <div class="field"><label for="qwen-connect-timeout">连接超时（秒）</label><input id="qwen-connect-timeout" type="number" step="any" data-path="voice.qwen.connect_timeout_s"></div>
-            <div class="field"><label for="qwen-event-timeout">事件超时（秒）</label><input id="qwen-event-timeout" type="number" step="any" data-path="voice.qwen.event_timeout_s"></div>
-            <div class="field"><label for="qwen-tool-timeout">工具超时（秒）</label><input id="qwen-tool-timeout" type="number" step="any" data-path="voice.qwen.tool_timeout_s"></div>
-            <div class="field"><label for="qwen-max-tools">每轮最大工具调用数</label><input id="qwen-max-tools" type="number" step="1" data-path="voice.qwen.max_tool_calls"></div>
-            <div class="field"><label for="qwen-max-iterations">最大工具迭代数</label><input id="qwen-max-iterations" type="number" step="1" data-path="voice.qwen.max_tool_iterations"></div>
+            <div class="field"><label for="qwen-model">模型</label><input id="qwen-model" required data-path="voice.qwen.model"></div>
+            <div class="field"><label for="qwen-voice">音色</label><input id="qwen-voice" required data-path="voice.qwen.voice"></div>
+            <div class="field"><label for="qwen-connect-timeout">连接超时（秒）</label><input id="qwen-connect-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.connect_timeout_s"></div>
+            <div class="field"><label for="qwen-event-timeout">事件超时（秒）</label><input id="qwen-event-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.event_timeout_s"></div>
+            <div class="field"><label for="qwen-tool-timeout">工具超时（秒）</label><input id="qwen-tool-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.tool_timeout_s"></div>
+            <div class="field"><label for="qwen-max-tools">每轮最大工具调用数</label><input id="qwen-max-tools" type="number" required min="1" step="1" data-path="voice.qwen.max_tool_calls"></div>
+            <div class="field"><label for="qwen-max-iterations">最大工具迭代数</label><input id="qwen-max-iterations" type="number" required min="1" step="1" data-path="voice.qwen.max_tool_iterations"></div>
           </div>
         </div>
       </fieldset>
@@ -182,25 +185,25 @@
         <div class="provider-panel" data-provider-section="open_ai" hidden>
           <h3>OpenAI 兼容 ASR</h3>
           <div class="fields">
-            <div class="field span-2"><label for="asr-open-base">基础 URL</label><input id="asr-open-base" data-path="asr.open_ai.base_url"></div>
+            <div class="field span-2"><label for="asr-open-base">基础 URL</label><input id="asr-open-base" type="url" data-path="asr.open_ai.base_url"></div>
             <div class="field span-2"><label for="asr-open-key">API 密钥</label><div class="secret-row"><input id="asr-open-key" type="password" autocomplete="new-password" data-secret-path="asr.open_ai.api_key"><button class="danger" type="button" data-clear-secret="asr.open_ai.api_key" aria-label="清除 OpenAI 兼容 ASR API 密钥">清除</button></div></div>
             <div class="field"><label for="asr-open-model">模型</label><input id="asr-open-model" data-path="asr.open_ai.model"></div>
             <div class="field"><label for="asr-open-language">语言</label><input id="asr-open-language" data-path="asr.open_ai.language"></div>
             <div class="field span-2"><label for="asr-open-prompt">提示词</label><textarea id="asr-open-prompt" data-path="asr.open_ai.prompt"></textarea></div>
-            <div class="field"><label for="asr-open-timeout">超时（秒）</label><input id="asr-open-timeout" type="number" step="any" data-path="asr.open_ai.timeout_s"></div>
-            <div class="field"><label for="asr-open-retries">重试次数</label><input id="asr-open-retries" type="number" step="1" data-path="asr.open_ai.retries"></div>
+            <div class="field"><label for="asr-open-timeout">超时（秒）</label><input id="asr-open-timeout" type="number" required min="0" step="any" data-positive="true" data-path="asr.open_ai.timeout_s"></div>
+            <div class="field"><label for="asr-open-retries">重试次数</label><input id="asr-open-retries" type="number" required min="0" max="4294967295" step="1" data-path="asr.open_ai.retries"></div>
           </div>
         </div>
         <div class="provider-panel" data-provider-section="openai_realtime" hidden>
           <h3>OpenAI 实时转写</h3>
           <div class="fields">
-            <div class="field span-2"><label for="asr-realtime-base">基础 URL</label><input id="asr-realtime-base" data-path="asr.openai_realtime.base_url"></div>
+            <div class="field span-2"><label for="asr-realtime-base">基础 URL</label><input id="asr-realtime-base" type="url" data-path="asr.openai_realtime.base_url"></div>
             <div class="field span-2"><label for="asr-realtime-key">API 密钥</label><div class="secret-row"><input id="asr-realtime-key" type="password" autocomplete="new-password" data-secret-path="asr.openai_realtime.api_key"><button class="danger" type="button" data-clear-secret="asr.openai_realtime.api_key" aria-label="清除 OpenAI 实时转写 API 密钥">清除</button></div></div>
             <div class="field"><label for="asr-realtime-model">模型</label><input id="asr-realtime-model" data-path="asr.openai_realtime.model"></div>
-            <div class="field"><label for="asr-realtime-rate">目标采样率</label><input id="asr-realtime-rate" type="number" step="1" data-path="asr.openai_realtime.target_sample_rate"></div>
-            <div class="field"><label for="asr-realtime-chunk">分块时长（毫秒）</label><input id="asr-realtime-chunk" type="number" step="1" data-path="asr.openai_realtime.chunk_ms"></div>
-            <div class="field"><label for="asr-realtime-timeout">超时（秒）</label><input id="asr-realtime-timeout" type="number" step="any" data-path="asr.openai_realtime.timeout_s"></div>
-            <div class="field"><label for="asr-realtime-retries">重试次数</label><input id="asr-realtime-retries" type="number" step="1" data-path="asr.openai_realtime.retries"></div>
+            <div class="field"><label for="asr-realtime-rate">目标采样率</label><input id="asr-realtime-rate" type="number" required min="0" max="4294967295" step="1" data-path="asr.openai_realtime.target_sample_rate"></div>
+            <div class="field"><label for="asr-realtime-chunk">分块时长（毫秒）</label><input id="asr-realtime-chunk" type="number" required min="0" max="4294967295" step="1" data-path="asr.openai_realtime.chunk_ms"></div>
+            <div class="field"><label for="asr-realtime-timeout">超时（秒）</label><input id="asr-realtime-timeout" type="number" required min="0" step="any" data-positive="true" data-path="asr.openai_realtime.timeout_s"></div>
+            <div class="field"><label for="asr-realtime-retries">重试次数</label><input id="asr-realtime-retries" type="number" required min="0" max="4294967295" step="1" data-path="asr.openai_realtime.retries"></div>
           </div>
         </div>
         <div class="provider-panel" data-provider-section="xiaomi_aivs" hidden>
@@ -212,13 +215,13 @@
       <fieldset>
         <legend>LLM</legend>
         <div class="fields">
-          <div class="field span-2"><label for="llm-base">基础 URL</label><input id="llm-base" data-path="llm.base_url"></div>
+          <div class="field span-2"><label for="llm-base">基础 URL</label><input id="llm-base" type="url" data-path="llm.base_url"></div>
           <div class="field span-2"><label for="llm-key">API 密钥</label><div class="secret-row"><input id="llm-key" type="password" autocomplete="new-password" data-secret-path="llm.api_key"><button class="danger" type="button" data-clear-secret="llm.api_key" aria-label="清除 LLM API 密钥">清除</button></div></div>
           <div class="field"><label for="llm-model">模型</label><input id="llm-model" data-path="llm.model"></div>
-          <div class="field"><label for="llm-timeout">超时（秒）</label><input id="llm-timeout" type="number" step="any" data-path="llm.timeout_s"></div>
-          <div class="field"><label for="llm-max-tokens">最大输出令牌数</label><input id="llm-max-tokens" type="number" step="1" data-path="llm.max_tokens"></div>
-          <div class="field"><label for="llm-retries">重试次数</label><input id="llm-retries" type="number" step="1" data-path="llm.retries"></div>
-          <div class="field"><label for="llm-temperature">温度</label><input id="llm-temperature" type="number" step="any" data-path="llm.temperature"></div>
+          <div class="field"><label for="llm-timeout">超时（秒）</label><input id="llm-timeout" type="number" required min="0" step="any" data-positive="true" data-path="llm.timeout_s"></div>
+          <div class="field"><label for="llm-max-tokens">最大输出令牌数</label><input id="llm-max-tokens" type="number" required min="0" step="1" data-path="llm.max_tokens"></div>
+          <div class="field"><label for="llm-retries">重试次数</label><input id="llm-retries" type="number" required min="0" max="4294967295" step="1" data-path="llm.retries"></div>
+          <div class="field"><label for="llm-temperature">温度</label><input id="llm-temperature" type="number" required step="any" data-path="llm.temperature"></div>
         </div>
       </fieldset>
     </section>
@@ -228,15 +231,15 @@
       <fieldset>
         <legend>天气与搜索</legend>
         <div class="fields">
-          <div class="field span-2"><label for="weather-url">QWeather 请求 URL（可能包含 key）</label><div class="secret-row"><input id="weather-url" type="password" autocomplete="new-password" data-secret-path="agent.weather.qweather_url"><button class="danger" type="button" data-clear-secret="agent.weather.qweather_url" aria-label="清除 QWeather 请求 URL">清除</button></div></div>
+          <div class="field span-2"><label for="weather-url">QWeather 请求 URL（可能包含 key）</label><div class="secret-row"><input id="weather-url" type="password" inputmode="url" autocomplete="new-password" data-url-secret="true" data-secret-path="agent.weather.qweather_url"><button class="danger" type="button" data-clear-secret="agent.weather.qweather_url" aria-label="清除 QWeather 请求 URL">清除</button></div></div>
           <div class="field"><label for="weather-location">默认位置</label><input id="weather-location" data-path="agent.weather.default_location"></div>
-          <div class="field"><label for="weather-ip-url">IP 定位 URL</label><input id="weather-ip-url" data-path="agent.weather.ip_lookup_url"></div>
-          <div class="field"><label for="weather-timeout">天气超时（秒）</label><input id="weather-timeout" type="number" step="any" data-path="agent.weather.timeout_s"></div>
+          <div class="field"><label for="weather-ip-url">IP 定位 URL</label><input id="weather-ip-url" type="url" data-path="agent.weather.ip_lookup_url"></div>
+          <div class="field"><label for="weather-timeout">天气超时（秒）</label><input id="weather-timeout" type="number" required min="0" step="any" data-positive="true" data-path="agent.weather.timeout_s"></div>
           <div class="check-field"><input id="search-enabled" type="checkbox" data-path="agent.web_search.enabled"><label for="search-enabled">启用网页搜索</label></div>
-          <div class="field span-2"><label for="search-url">Tavily URL</label><input id="search-url" data-path="agent.web_search.tavily_url"></div>
+          <div class="field span-2"><label for="search-url">Tavily URL</label><input id="search-url" type="url" data-path="agent.web_search.tavily_url"></div>
           <div class="field span-2"><label for="search-key">Tavily API 密钥</label><div class="secret-row"><input id="search-key" type="password" autocomplete="new-password" data-secret-path="agent.web_search.api_key"><button class="danger" type="button" data-clear-secret="agent.web_search.api_key" aria-label="清除 Tavily API 密钥">清除</button></div></div>
-          <div class="field"><label for="search-timeout">搜索超时（秒）</label><input id="search-timeout" type="number" step="any" data-path="agent.web_search.timeout_s"></div>
-          <div class="field"><label for="search-results">最大结果数</label><input id="search-results" type="number" step="1" data-path="agent.web_search.max_results"></div>
+          <div class="field"><label for="search-timeout">搜索超时（秒）</label><input id="search-timeout" type="number" required min="0" step="any" data-positive="true" data-path="agent.web_search.timeout_s"></div>
+          <div class="field"><label for="search-results">最大结果数</label><input id="search-results" type="number" min="1" max="10" step="1" required data-path="agent.web_search.max_results"></div>
           <div class="field"><label for="search-depth">搜索深度</label><input id="search-depth" data-path="agent.web_search.search_depth"></div>
         </div>
       </fieldset>
@@ -245,9 +248,9 @@
         <legend>Home Assistant</legend>
         <div class="fields">
           <div class="check-field"><input id="ha-enabled" type="checkbox" data-path="home_assistant.enabled"><label for="ha-enabled">启用 Home Assistant</label></div>
-          <div class="field span-2"><label for="ha-url">服务 URL</label><input id="ha-url" data-path="home_assistant.url"></div>
+          <div class="field span-2"><label for="ha-url">服务 URL</label><input id="ha-url" type="url" data-path="home_assistant.url"></div>
           <div class="field span-2"><label for="ha-token">访问令牌</label><div class="secret-row"><input id="ha-token" type="password" autocomplete="new-password" data-secret-path="home_assistant.token"><button class="danger" type="button" data-clear-secret="home_assistant.token" aria-label="清除 Home Assistant 访问令牌">清除</button></div></div>
-          <div class="field"><label for="ha-timeout">超时（秒）</label><input id="ha-timeout" type="number" step="any" data-path="home_assistant.timeout_s"></div>
+          <div class="field"><label for="ha-timeout">超时（秒）</label><input id="ha-timeout" type="number" required min="0" step="any" data-positive="true" data-path="home_assistant.timeout_s"></div>
         </div>
       </fieldset>
 
@@ -261,24 +264,24 @@
         <div class="provider-panel" data-provider-section="navidrome" hidden>
           <h3>Navidrome</h3>
           <div class="fields">
-            <div class="field span-2"><label for="navidrome-url">基础 URL</label><input id="navidrome-url" data-path="music.navidrome.base_url"></div>
+            <div class="field span-2"><label for="navidrome-url">基础 URL</label><input id="navidrome-url" type="url" data-path="music.navidrome.base_url"></div>
             <div class="field"><label for="navidrome-user">用户名</label><input id="navidrome-user" data-path="music.navidrome.username"></div>
             <div class="field span-2"><label for="navidrome-password">密码</label><div class="secret-row"><input id="navidrome-password" type="password" autocomplete="new-password" data-secret-path="music.navidrome.password"><button class="danger" type="button" data-clear-secret="music.navidrome.password" aria-label="清除 Navidrome 密码">清除</button></div></div>
             <div class="field"><label for="navidrome-version">API 版本</label><input id="navidrome-version" data-path="music.navidrome.api_version"></div>
-            <div class="field"><label for="navidrome-timeout">超时（秒）</label><input id="navidrome-timeout" type="number" step="any" data-path="music.navidrome.timeout_s"></div>
+            <div class="field"><label for="navidrome-timeout">超时（秒）</label><input id="navidrome-timeout" type="number" required min="0" step="any" data-positive="true" data-path="music.navidrome.timeout_s"></div>
           </div>
         </div>
         <div class="provider-panel" data-provider-section="netease" hidden>
           <h3>网易云音乐</h3>
           <div class="fields">
-            <div class="field span-2"><label for="netease-url">API 基础 URL</label><input id="netease-url" data-path="music.netease.api_base_url"></div>
+            <div class="field span-2"><label for="netease-url">API 基础 URL</label><input id="netease-url" type="url" data-path="music.netease.api_base_url"></div>
             <div class="field"><label for="netease-login-mode">登录模式</label><input id="netease-login-mode" data-path="music.netease.login_mode"></div>
             <div class="field"><label for="netease-account">账号</label><input id="netease-account" data-path="music.netease.account"></div>
             <div class="field"><label for="netease-phone">手机号</label><input id="netease-phone" data-path="music.netease.phone"></div>
             <div class="field span-2"><label for="netease-password">密码</label><div class="secret-row"><input id="netease-password" type="password" autocomplete="new-password" data-secret-path="music.netease.password"><button class="danger" type="button" data-clear-secret="music.netease.password" aria-label="清除网易云音乐密码">清除</button></div></div>
             <div class="field span-2"><label for="netease-md5">MD5 密码</label><div class="secret-row"><input id="netease-md5" type="password" autocomplete="new-password" data-secret-path="music.netease.md5_password"><button class="danger" type="button" data-clear-secret="music.netease.md5_password" aria-label="清除网易云音乐 MD5 密码">清除</button></div></div>
             <div class="field"><label for="netease-level">默认音质</label><input id="netease-level" data-path="music.netease.default_level"></div>
-            <div class="field"><label for="netease-timeout">超时（秒）</label><input id="netease-timeout" type="number" step="any" data-path="music.netease.timeout_s"></div>
+            <div class="field"><label for="netease-timeout">超时（秒）</label><input id="netease-timeout" type="number" required min="0" step="any" data-positive="true" data-path="music.netease.timeout_s"></div>
             <div class="check-field"><input id="netease-login-start" type="checkbox" data-path="music.netease.login_on_start"><label for="netease-login-start">启动时登录</label></div>
           </div>
         </div>
@@ -289,10 +292,10 @@
         <div class="fields">
           <div class="check-field"><input id="airplay-enabled" type="checkbox" data-path="airplay.enabled"><label for="airplay-enabled">启用 AirPlay</label></div>
           <div class="field"><label for="airplay-name">广播名称</label><input id="airplay-name" data-path="airplay.name"></div>
-          <div class="field"><label for="airplay-port">端口</label><input id="airplay-port" type="number" step="1" data-path="airplay.port"></div>
+          <div class="field"><label for="airplay-port">端口</label><input id="airplay-port" type="number" min="1" max="65535" step="1" required data-path="airplay.port"></div>
           <div class="field span-2"><label for="airplay-password">密码</label><div class="secret-row"><input id="airplay-password" type="password" autocomplete="new-password" data-secret-path="airplay.password"><button class="danger" type="button" data-clear-secret="airplay.password" aria-label="清除 AirPlay 密码">清除</button></div></div>
           <div class="field"><label for="airplay-interruption">语音打断模式</label><select id="airplay-interruption" data-path="airplay.interruption_mode"><option value="duck">降低音量</option><option value="none">不处理</option></select></div>
-          <div class="field"><label for="airplay-gain">降低后增益</label><input id="airplay-gain" type="number" step="any" data-path="airplay.duck_gain"></div>
+          <div class="field"><label for="airplay-gain">降低后增益</label><input id="airplay-gain" type="number" min="0" max="1" step="any" required data-path="airplay.duck_gain"></div>
         </div>
       </fieldset>
     </section>
@@ -303,7 +306,7 @@
         <legend>常规</legend>
         <div class="fields">
           <div class="field span-2"><label for="acknowledge-text">唤醒回应语</label><textarea id="acknowledge-text" data-path="runtime.acknowledge_text" data-list="true" aria-describedby="acknowledge-help"></textarea><p class="helper" id="acknowledge-help">每行或用逗号分隔一条回应语。</p></div>
-          <div class="field"><label for="idle-timeout">会话空闲超时（秒）</label><input id="idle-timeout" type="number" step="any" data-path="runtime.session_idle_timeout_s"></div>
+          <div class="field"><label for="idle-timeout">会话空闲超时（秒）</label><input id="idle-timeout" type="number" required min="0" step="any" data-positive="true" data-path="runtime.session_idle_timeout_s"></div>
           <div class="field"><label for="timezone">时区</label><input id="timezone" data-path="agent.timezone"></div>
           <div class="check-field"><input id="led-enabled" type="checkbox" data-path="led_enabled"><label for="led-enabled">启用状态灯</label></div>
         </div>
@@ -335,6 +338,7 @@
     status: null,
     secrets: {},
     busy: false,
+    dirty: false,
     pendingRestart: false,
     pendingRestartStartedAt: null,
     statusTimer: null,
@@ -396,6 +400,7 @@
 
   function renderConfig(response) {
     pageState.config = response;
+    pageState.dirty = false;
     document.querySelectorAll("[data-path]").forEach((control) => {
       const value = getPath(response.editable, control.dataset.path);
       if (control.type === "checkbox") control.checked = Boolean(value);
@@ -439,7 +444,10 @@
 
   async function saveConfig(event) {
     event.preventDefault();
-    if (pageState.busy || !pageState.config || !byId("config-form").reportValidity()) return;
+    clearFieldErrors();
+    if (pageState.busy || !pageState.config) return;
+    validateClientConstraints();
+    if (!byId("config-form").reportValidity()) return;
     setBusy(true);
     showMessage("正在保存配置…");
     try {
@@ -453,9 +461,11 @@
       renderConfig(response);
       showMessage("配置已保存。重启 XiaoAI Agent 后生效。", "success");
     } catch (error) {
-      const prefix = error.field ? `${error.field}：` : "";
+      const field = normalizeFieldPath(error.field);
+      const prefix = field ? `${field}：` : "";
       showMessage(`${prefix}${error.message}`, "error");
-      focusField(error.field);
+      showFieldError(field, "此字段的配置无效，请检查后重试。");
+      focusField(field);
     } finally {
       setBusy(false);
     }
@@ -467,13 +477,17 @@
     showMessage("正在请求重启…", "warning");
     const deadline = Date.now() + RESTART_TIMEOUT_MS;
     try {
-      let before = pageState.status && pageState.status.started_at_unix_ms;
-      if (before == null) {
-        const remaining = deadline - Date.now();
-        const status = await requestJson("/api/status", { timeoutMs: remaining });
-        renderStatus(status);
-        before = status.started_at_unix_ms;
+      const baselineRemaining = deadline - Date.now();
+      if (baselineRemaining <= 0) throw new DOMException("restart deadline reached", "AbortError");
+      try {
+        const baseline = await requestJson("/api/status", { timeoutMs: baselineRemaining });
+        renderStatus(baseline);
+        pageState.status = baseline;
+      } catch (error) {
+        showMessage(`无法读取重启前状态：${error.message}。请确认服务可访问后重试。`, "error");
+        return;
       }
+      const before = pageState.status.started_at_unix_ms;
       const postRemaining = deadline - Date.now();
       if (postRemaining <= 0) throw new DOMException("restart deadline reached", "AbortError");
       await requestJson("/api/restart", {
@@ -563,6 +577,11 @@
 
   function updateConfigState(restartRequired) {
     const target = byId("config-state");
+    if (pageState.dirty) {
+      target.textContent = "未保存";
+      target.className = "warn";
+      return;
+    }
     const effectiveRestartRequired = restartRequired || pageState.pendingRestart;
     target.textContent = pageState.pendingRestart ? "配置已保存，需重启" : (effectiveRestartRequired ? "需要重启" : "已生效");
     target.className = effectiveRestartRequired ? "warn" : "ok";
@@ -613,9 +632,81 @@
     return list;
   }
 
+  function normalizeFieldPath(path) {
+    if (!path) return null;
+    if (path.startsWith("mcp.home_assistant.")) return path.replace("mcp.home_assistant.", "home_assistant.");
+    const aliases = {
+      "music.interruption.mode": "music.interruption_mode",
+      "airplay.interruption.mode": "airplay.interruption_mode",
+      "airplay.interruption.duck_gain": "airplay.duck_gain",
+      "device.led_enabled": "led_enabled"
+    };
+    return aliases[path] || path;
+  }
+
+  function findField(path) {
+    const normalized = normalizeFieldPath(path);
+    return Array.from(document.querySelectorAll("[data-path], [data-secret-path]")).find((item) => item.dataset.path === normalized || item.dataset.secretPath === normalized);
+  }
+
+  function clearFieldError(control) {
+    if (!control) return;
+    const errorId = control.dataset.fieldErrorId;
+    if (errorId) {
+      byId(errorId)?.remove();
+      const describedBy = (control.getAttribute("aria-describedby") || "").split(/\s+/).filter((id) => id && id !== errorId);
+      if (describedBy.length) control.setAttribute("aria-describedby", describedBy.join(" "));
+      else control.removeAttribute("aria-describedby");
+      delete control.dataset.fieldErrorId;
+    }
+    control.removeAttribute("aria-invalid");
+  }
+
+  function clearFieldErrors() {
+    document.querySelectorAll("[aria-invalid='true']").forEach(clearFieldError);
+  }
+
+  function showFieldError(path, text) {
+    const control = findField(path);
+    if (!control) return;
+    clearFieldError(control);
+    const error = document.createElement("p");
+    const errorId = `${control.id}-field-error`;
+    error.id = errorId;
+    error.className = "field-error";
+    error.textContent = text;
+    control.closest(".field, .check-field")?.append(error);
+    control.dataset.fieldErrorId = errorId;
+    control.setAttribute("aria-invalid", "true");
+    const describedBy = (control.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+    if (!describedBy.includes(errorId)) describedBy.push(errorId);
+    control.setAttribute("aria-describedby", describedBy.join(" "));
+  }
+
+  function validateClientConstraints() {
+    document.querySelectorAll("[data-positive]").forEach((control) => {
+      const value = Number(control.value);
+      control.setCustomValidity(Number.isFinite(value) && value > 0 ? "" : "请输入大于 0 的数值。");
+    });
+    document.querySelectorAll("[data-url-secret]").forEach((control) => {
+      const secret = pageState.secrets[control.dataset.secretPath];
+      let valid = true;
+      if (secret && secret.mode === "replace" && control.value) {
+        try { new URL(control.value); } catch (_error) { valid = false; }
+      }
+      control.setCustomValidity(valid ? "" : "请输入完整的 URL。");
+    });
+    return byId("config-form").checkValidity();
+  }
+
+  function markDirty() {
+    if (!pageState.config) return;
+    pageState.dirty = true;
+    updateConfigState(Boolean(pageState.status && pageState.status.restart_required));
+  }
+
   function focusField(path) {
-    if (!path) return;
-    const control = Array.from(document.querySelectorAll("[data-path], [data-secret-path]")).find((item) => item.dataset.path === path || item.dataset.secretPath === path);
+    const control = findField(path);
     if (control) control.focus();
   }
 
@@ -625,6 +716,8 @@
     if (!control) return;
     control.value = "";
     pageState.secrets[path] = { mode: "clear", value: null };
+    clearFieldError(control);
+    markDirty();
     showMessage("已标记为清除；保存配置后生效。", "warning");
   }
 
@@ -648,6 +741,20 @@
   byId("asr-provider").addEventListener("change", updateConditionalSections);
   byId("music-provider").addEventListener("change", updateConditionalSections);
   byId("advanced").addEventListener("toggle", refreshLogs);
+  byId("config-form").addEventListener("input", (event) => {
+    const control = event.target.closest("[data-path], [data-secret-path]");
+    if (!control) return;
+    control.setCustomValidity("");
+    clearFieldError(control);
+    markDirty();
+  });
+  byId("config-form").addEventListener("change", (event) => {
+    const control = event.target.closest("[data-path], [data-secret-path]");
+    if (!control) return;
+    control.setCustomValidity("");
+    clearFieldError(control);
+    markDirty();
+  });
   document.querySelectorAll("[data-secret-path]").forEach((control) => {
     control.addEventListener("input", () => {
       pageState.secrets[control.dataset.secretPath] = control.value ? { mode: "replace", value: null } : { mode: "keep", value: null };
