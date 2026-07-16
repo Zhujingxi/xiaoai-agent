@@ -1,5 +1,8 @@
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
+#[cfg(test)]
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -7,40 +10,61 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Context;
+#[cfg(test)]
 use base64::Engine as _;
 use futures::future::BoxFuture;
+#[cfg(test)]
 use futures::stream::FuturesUnordered;
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::FutureExt;
+#[cfg(test)]
+use futures::{SinkExt, StreamExt};
 use rig_core::tool::server::ToolServerHandle;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep_until, timeout, Instant};
+use tokio::time::timeout;
+#[cfg(test)]
+use tokio::time::{sleep_until, Instant};
+#[cfg(test)]
 use tokio_tungstenite::connect_async;
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::Message;
+#[cfg(test)]
 use tracing::{debug, warn};
+#[cfg(test)]
 use url::Url;
 
 use crate::agent::SPEAKER_AGENT_INSTRUCTIONS;
+#[cfg(test)]
 use crate::audio::record::AudioRecorder;
 use crate::capture::record_utterance_streaming;
 use crate::config::{timeout_duration, CaptureConfig, QwenRealtimeConfig};
 use crate::mcp::{NativeMcpCallError, NativeMcpClient};
+#[cfg(test)]
+use crate::qwen_realtime::Base64Pcm;
 use crate::qwen_realtime::{
-    AudioFormat, Base64Pcm, CallId, ClientEvent, ConversationItem, FunctionCallOutput,
-    FunctionDefinition, Modality, ResponseId, ResponseOutputItem, ResponseStatus, ServerEvent,
-    SessionUpdate, ToolDefinition,
+    AudioFormat, CallId, ClientEvent, ConversationItem, FunctionCallOutput, FunctionDefinition,
+    Modality, ResponseId, ResponseOutputItem, ResponseStatus, ServerEvent, SessionUpdate,
+    ToolDefinition,
 };
 
+mod webrtc_session;
+
+#[cfg(test)]
+#[allow(dead_code)]
 const UPLOAD_QUEUE_CAPACITY: usize = 32;
 const PLAYBACK_QUEUE_CAPACITY: usize = 64;
 const PLAYER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const PLAYER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const PLAYER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const CANCEL_EVENT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -130,6 +154,8 @@ impl SessionMachine {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackpressurePolicy {
     DropNewest,
@@ -143,12 +169,15 @@ pub enum QueueError {
     Closed,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 #[derive(Clone)]
 struct BoundedAudioSender {
     tx: mpsc::Sender<UploadCommand>,
     policy: BackpressurePolicy,
 }
 
+#[cfg(test)]
 impl BoundedAudioSender {
     fn try_send(&self, bytes: Vec<u8>) -> Result<(), QueueError> {
         match self.tx.try_send(UploadCommand::Audio(bytes)) {
@@ -159,6 +188,7 @@ impl BoundedAudioSender {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum UploadCommand {
     Audio(Vec<u8>),
@@ -169,6 +199,7 @@ enum UploadCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaybackControl {
     Running,
+    Drain,
     Shutdown,
 }
 
@@ -181,7 +212,7 @@ pub struct PcmPlayerHandle {
 
 impl PcmPlayerHandle {
     fn try_audio(&self, bytes: Vec<u8>) -> Result<(), QueueError> {
-        if *self.control_tx.borrow() == PlaybackControl::Shutdown {
+        if *self.control_tx.borrow() != PlaybackControl::Running {
             return Err(QueueError::Closed);
         }
         match self.audio_tx.try_send(bytes) {
@@ -199,8 +230,20 @@ impl PcmPlayerHandle {
         *state = PlaybackControl::Shutdown;
         let _ = self.control_tx.send(PlaybackControl::Shutdown);
     }
+
+    fn finish(&self) {
+        let mut state = match self.spawn_gate.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *state == PlaybackControl::Running {
+            *state = PlaybackControl::Drain;
+            let _ = self.control_tx.send(PlaybackControl::Drain);
+        }
+    }
 }
 
+#[cfg(test)]
 trait SessionPlayer {
     fn try_audio(&self, bytes: Vec<u8>) -> Result<(), QueueError>;
     fn stop(&self);
@@ -272,9 +315,23 @@ impl PcmPlayer {
         }
     }
 
-    #[cfg(test)]
     fn handle(&self) -> PcmPlayerHandle {
         self.handle.clone()
+    }
+
+    async fn finish(mut self) -> anyhow::Result<()> {
+        self.handle.finish();
+        let Some(mut task) = self.task.take() else {
+            return Ok(());
+        };
+        match timeout(PLAYER_DRAIN_TIMEOUT + PLAYER_SHUTDOWN_TIMEOUT, &mut task).await {
+            Ok(result) => result.context("realtime PCM player task panicked")?,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                anyhow::bail!("timed out draining realtime PCM player");
+            }
+        }
     }
 
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
@@ -293,6 +350,7 @@ impl PcmPlayer {
     }
 }
 
+#[cfg(test)]
 impl SessionPlayer for PcmPlayer {
     fn try_audio(&self, bytes: Vec<u8>) -> Result<(), QueueError> {
         self.handle.try_audio(bytes)
@@ -377,6 +435,19 @@ async fn stop_child(child: &mut Child) {
     let _ = timeout(PLAYER_SHUTDOWN_TIMEOUT, child.wait()).await;
 }
 
+async fn drain_child(child: &mut Child) -> anyhow::Result<()> {
+    match timeout(PLAYER_DRAIN_TIMEOUT, child.wait()).await {
+        Ok(result) => {
+            result.context("wait for realtime PCM player drain")?;
+            Ok(())
+        }
+        Err(_) => {
+            stop_child(child).await;
+            anyhow::bail!("timed out draining realtime PCM player process")
+        }
+    }
+}
+
 fn construct_player_if_running<T>(
     spawn_gate: &StdMutex<PlaybackControl>,
     setup_phase: Option<&StdMutex<SetupPhase>>,
@@ -385,7 +456,7 @@ fn construct_player_if_running<T>(
     let state = spawn_gate
         .lock()
         .map_err(|_| anyhow::anyhow!("realtime player spawn gate was poisoned"))?;
-    if *state == PlaybackControl::Shutdown {
+    if *state != PlaybackControl::Running {
         return Ok(None);
     }
     let session_phase = setup_phase
@@ -421,11 +492,16 @@ where
     else {
         return Ok(());
     };
+    let mut drain = false;
     'player: loop {
         tokio::select! {
             biased;
             changed = control_rx.changed() => {
                 if changed.is_err() || *control_rx.borrow() == PlaybackControl::Shutdown {
+                    break;
+                }
+                if *control_rx.borrow() == PlaybackControl::Drain {
+                    drain = true;
                     break;
                 }
             }
@@ -447,9 +523,22 @@ where
             }
         }
     }
+    if drain {
+        audio_rx.close();
+        while let Some(bytes) = audio_rx.recv().await {
+            timeout(PLAYER_WRITE_TIMEOUT, stdin.write_all(&bytes))
+                .await
+                .context("realtime player drain write timed out")?
+                .context("drain realtime PCM")?;
+        }
+    }
     drop(stdin);
-    stop_child(&mut child).await;
-    Ok(())
+    if drain {
+        drain_child(&mut child).await
+    } else {
+        stop_child(&mut child).await;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1126,6 +1215,7 @@ impl NativeToolRuntime {
         self.effects_observed.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
     fn generic_fail_closed(&self) -> bool {
         self.generic_calls.fail_closed.load(Ordering::SeqCst)
     }
@@ -1226,6 +1316,8 @@ where
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn connect(
     config: &QwenRealtimeConfig,
     cancel_rx: &mut watch::Receiver<bool>,
@@ -1258,6 +1350,7 @@ async fn connect(
     .await
 }
 
+#[cfg(test)]
 async fn send_event_bounded<S, E>(
     sink: &mut S,
     event: &ClientEvent,
@@ -1274,6 +1367,7 @@ where
         .context("send Qwen realtime event")
 }
 
+#[cfg(test)]
 async fn send_event_cancellable<S, E>(
     sink: &mut S,
     event: &ClientEvent,
@@ -1306,16 +1400,18 @@ async fn run_realtime_session(
     mut cancel_rx: watch::Receiver<bool>,
     setup_phase: Arc<StdMutex<SetupPhase>>,
 ) -> anyhow::Result<()> {
-    let mut connector = ProductionSessionConnector {
+    webrtc_session::run(
         config,
         capture,
-        tools: tools.clone(),
+        tools,
         idle_timeout,
+        &mut cancel_rx,
         setup_phase,
-    };
-    run_realtime_session_loop(&tools, &mut cancel_rx, &mut connector).await
+    )
+    .await
 }
 
+#[cfg(test)]
 trait RealtimeSessionConnector {
     fn run_connected<'a>(
         &'a mut self,
@@ -1324,6 +1420,8 @@ trait RealtimeSessionConnector {
     ) -> BoxFuture<'a, anyhow::Result<()>>;
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 struct ProductionSessionConnector {
     config: QwenRealtimeConfig,
     capture: CaptureConfig,
@@ -1332,6 +1430,7 @@ struct ProductionSessionConnector {
     setup_phase: Arc<StdMutex<SetupPhase>>,
 }
 
+#[cfg(test)]
 impl RealtimeSessionConnector for ProductionSessionConnector {
     fn run_connected<'a>(
         &'a mut self,
@@ -1351,6 +1450,7 @@ impl RealtimeSessionConnector for ProductionSessionConnector {
     }
 }
 
+#[cfg(test)]
 async fn run_realtime_session_loop<C: RealtimeSessionConnector>(
     tools: &NativeToolRuntime,
     cancel_rx: &mut watch::Receiver<bool>,
@@ -1393,6 +1493,8 @@ async fn run_realtime_session_loop<C: RealtimeSessionConnector>(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Qwen realtime session failed")))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn run_connected_session(
     config: &QwenRealtimeConfig,
     capture: &CaptureConfig,
@@ -1526,6 +1628,7 @@ async fn run_connected_session(
     .await
 }
 
+#[cfg(test)]
 async fn send_tool_execution<S, E>(
     sink: &mut S,
     execution: ToolExecution,
@@ -1552,6 +1655,7 @@ where
     .context("send Qwen function_call_output")
 }
 
+#[cfg(test)]
 async fn continue_after_tools<S, E>(
     sink: &mut S,
     event_timeout: Duration,
@@ -1574,6 +1678,7 @@ where
     .context("continue Qwen response after tools")
 }
 
+#[cfg(test)]
 async fn run_connected_resources_with_timeout<S, St, SinkError, StreamError, P, CaptureOutput>(
     sink: &mut S,
     stream: &mut St,
@@ -2079,8 +2184,8 @@ fn validate_pcm_contract(
         capture.bits_per_sample
     );
     anyhow::ensure!(
-        config.output_sample_rate.0 == 24_000,
-        "native Qwen playback must be 24 kHz mono S16_LE"
+        config.output_sample_rate.0 == 48_000,
+        "native Qwen WebRTC playback must be 48 kHz mono S16_LE"
     );
     Ok(())
 }
@@ -2145,7 +2250,7 @@ mod tests {
     }
 
     #[test]
-    fn native_qwen_session_uses_manual_turn_detection() {
+    fn qwen_session_event_serializes_semantic_vad() {
         let event = ClientEvent::SessionUpdate {
             event_id: None,
             session: SessionUpdate {
@@ -2153,7 +2258,11 @@ mod tests {
                 voice: "Cherry".to_string(),
                 input_audio_format: AudioFormat::Pcm,
                 output_audio_format: AudioFormat::Pcm,
-                turn_detection: None,
+                turn_detection: Some(json!({
+                    "type": "semantic_vad",
+                    "threshold": 0.5,
+                    "silence_duration_ms": 800
+                })),
                 instructions: None,
                 tools: Vec::new(),
             },
@@ -2161,7 +2270,7 @@ mod tests {
 
         let value = serde_json::to_value(event).unwrap();
 
-        assert!(value["session"]["turn_detection"].is_null());
+        assert_eq!(value["session"]["turn_detection"]["type"], "semantic_vad");
     }
 
     #[derive(Clone)]
@@ -3478,7 +3587,9 @@ mod tests {
         let mut tools = NativeToolRuntime::load(&QwenRealtimeConfig::default(), server)
             .await
             .unwrap();
-        tools.call_timeout = Duration::from_millis(30);
+        // Leave enough startup headroom for the shell process on loaded CI hosts;
+        // the command still sleeps for one second, so this remains a real timeout.
+        tools.call_timeout = Duration::from_millis(250);
         let stream = futures::stream::iter([
             Ok::<_, MockWsError>(function_call_with(
                 "call-timeout",
@@ -3497,7 +3608,7 @@ mod tests {
             )),
         ])
         .chain(futures::stream::once(async {
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            tokio::time::sleep(Duration::from_millis(350)).await;
             Ok(function_call_with(
                 "call-retry",
                 "tool-response",
@@ -3571,7 +3682,7 @@ mod tests {
             cancel_rx,
         ));
         timeout(Duration::from_secs(1), async {
-            while !path.exists() {
+            while std::fs::metadata(&path).map_or(true, |metadata| metadata.len() == 0) {
                 tokio::task::yield_now().await;
             }
         })
@@ -5472,8 +5583,8 @@ mod tests {
     #[test]
     fn aplay_uses_exact_native_qwen_pcm_contract() {
         assert_eq!(
-            aplay_args("default", 24_000),
-            ["-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", "24000", "-c", "1"]
+            aplay_args("default", 48_000),
+            ["-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "1"]
         );
     }
 

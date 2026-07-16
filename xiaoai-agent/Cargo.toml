@@ -17,6 +17,7 @@ debug = false
 anyhow = "1"
 axum = { version = "0.8", features = ["http1", "json", "tokio"] }
 base64 = "0.22"
+bytes = "1"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 chrono-tz = "0.10"
 clap = { version = "4.5", features = ["derive"] }
@@ -24,6 +25,8 @@ futures = "0.3"
 libloading = "0.8"
 md5 = "0.7"
 nix = { version = "0.30", features = ["signal"] }
+opus = "0.3.1"
+audiopus_sys = { version = "0.2.2", features = ["static"] }
 rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["gzip", "json", "multipart", "rustls", "stream"] }
 rig-core = { version = "0.39", features = ["rmcp"] }
@@ -40,6 +43,7 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+webrtc = "0.17.1"
 
 [dev-dependencies]
 tempfile = "3"

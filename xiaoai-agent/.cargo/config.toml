@@ -1,0 +1,9 @@
+[env]
+# audiopus_sys bundles an older libopus CMake project. CMake 4 requires this
+# compatibility floor when building that static dependency for the speaker.
+CMAKE_POLICY_VERSION_MINIMUM = { value = "3.5", force = false }
+
+# cargo-zigbuild supplies the actual ARM compiler toolchain. This small wrapper
+# only disables libopus' optional NEON runtime-dispatch sources, which CMake 4
+# otherwise detects without passing the matching target feature to Zig's clang.
+CMAKE_armv7_unknown_linux_gnueabihf = { value = ".cargo/cmake-armv7.sh", relative = true, force = false }

@@ -49,18 +49,21 @@ capture:
 
 voice:
   # legacy keeps the ASR -> text Agent -> device TTS pipeline below.
-  # native_qwen streams microphone/audio directly to Qwen Realtime and lets it call
-  # the same built-in and MCP tools registered with the text Agent.
+  # native_qwen sends VPM-processed microphone audio to Qwen Realtime over WebRTC
+  # and lets it call the same built-in and MCP tools registered with the text Agent.
   runtime: legacy
   qwen:
-    url: wss://dashscope.aliyuncs.com/api-ws/v1/realtime
+    # Beijing endpoint. Replace {WorkspaceId}; for Singapore use
+    # https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api/v1/webrtc/realtime
+    url: https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/webrtc/realtime
     api_key: EMPTY
     model: qwen3.5-omni-plus-realtime
-    voice: Cherry
+    voice: Tina
     input_audio_format: pcm
     output_audio_format: pcm
     input_sample_rate: 16000
-    output_sample_rate: 24000
+    # WebRTC negotiates Opus at a 48 kHz RTP clock. Playback is decoded to 48 kHz PCM.
+    output_sample_rate: 48000
     connect_timeout_s: 10
     event_timeout_s: 30
     # Native tool calls are cancellable, individually timed out, and bounded per turn.

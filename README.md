@@ -102,9 +102,12 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
 - `llm.base_url`、`llm.api_key`、`llm.model`：大模型服务配置
 - `voice.runtime`：语音运行时。默认 `legacy` 保留现有的 ASR → 文本 Agent →
   设备 TTS 链路；`native_qwen` 改用 Qwen3.5 Omni Realtime 的双向音频链路，
-  此时必须配置 `voice.qwen.api_key`
-- `voice.qwen`：原生 Qwen Realtime 的 WebSocket、模型、音色和 PCM 参数。
-  输入固定为 16 kHz 单声道 S16_LE，输出固定为 24 kHz 单声道 S16_LE；
+  此时必须配置 `voice.qwen.api_key`，并把 `voice.qwen.url` 中的
+  `{WorkspaceId}` 替换为 API Key 所属地域的百炼业务空间 ID
+- `voice.qwen`：原生 Qwen Realtime 的 WebRTC 信令地址、模型、音色和音频参数。
+  VPM 输入固定为 16 kHz 单声道 S16_LE，传输层编码为 Opus/RTP；模型返回的
+  Opus/RTP 音频解码为 48 kHz 单声道 S16_LE 播放。会话使用 `semantic_vad`，
+  控制事件和工具调用通过服务端 `txt` DataChannel 传输；
   `tool_timeout_s`、`max_tool_calls` 和 `max_tool_iterations` 为每轮工具执行设置
   超时与上限，防止模型无限递归调用
 - `mcp.home_assistant`：Home Assistant MCP 配置；`timeout_s` 除了限制旧版 SSE
@@ -120,7 +123,7 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
 再请求模型继续生成最终语音。`call_id` 在整轮会话中只能使用一次，后续迭代重放会
 直接终止该会话且不会再次执行工具；大小限制内的畸形或非对象 JSON 参数不会调用
 MCP，而会作为 `invalid_arguments` 结构化错误返回模型。未知工具、MCP 错误和超时也
-会作为结构化错误返回模型。工具执行和 WebSocket 发送均响应会话取消。
+会作为结构化错误返回模型。工具执行和 WebRTC DataChannel 发送均响应会话取消。
 `legacy` 运行时不启用此原生循环，行为保持不变。
 
 #### Web 配置页面

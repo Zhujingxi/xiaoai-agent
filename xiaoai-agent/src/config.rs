@@ -96,14 +96,15 @@ pub struct QwenRealtimeConfig {
 impl Default for QwenRealtimeConfig {
     fn default() -> Self {
         Self {
-            url: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime".to_string(),
+            url: "https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/webrtc/realtime"
+                .to_string(),
             api_key: "EMPTY".to_string(),
             model: "qwen3.5-omni-plus-realtime".to_string(),
-            voice: "Cherry".to_string(),
+            voice: "Tina".to_string(),
             input_audio_format: AudioFormat::Pcm,
             output_audio_format: AudioFormat::Pcm,
             input_sample_rate: SampleRate(16_000),
-            output_sample_rate: SampleRate(24_000),
+            output_sample_rate: SampleRate(48_000),
             connect_timeout_s: 10.0,
             event_timeout_s: 30.0,
             tool_timeout_s: 10.0,
@@ -115,7 +116,7 @@ impl Default for QwenRealtimeConfig {
 
 impl QwenRealtimeConfig {
     fn validate(&self, enabled: bool) -> Result<(), RealtimeVoiceConfigError> {
-        if !self.url.starts_with("wss://") {
+        if !self.url.starts_with("https://") {
             return Err(RealtimeVoiceConfigError::InvalidUrl);
         }
         if self.model.trim().is_empty() {
@@ -129,7 +130,7 @@ impl QwenRealtimeConfig {
                 self.input_sample_rate.0,
             ));
         }
-        if self.output_sample_rate.0 != 24_000 {
+        if self.output_sample_rate.0 != 48_000 {
             return Err(RealtimeVoiceConfigError::InvalidOutputSampleRate(
                 self.output_sample_rate.0,
             ));
@@ -149,13 +150,16 @@ impl QwenRealtimeConfig {
         if enabled && (self.api_key.trim().is_empty() || self.api_key == "EMPTY") {
             return Err(RealtimeVoiceConfigError::MissingApiKey);
         }
+        if enabled && self.url.contains("{WorkspaceId}") {
+            return Err(RealtimeVoiceConfigError::MissingWorkspaceId);
+        }
         Ok(())
     }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RealtimeVoiceConfigError {
-    #[error("voice.qwen.url must use wss://")]
+    #[error("voice.qwen.url must use the https:// WebRTC signaling endpoint")]
     InvalidUrl,
     #[error("voice.qwen.model must not be empty")]
     EmptyModel,
@@ -163,7 +167,7 @@ pub enum RealtimeVoiceConfigError {
     EmptyVoice,
     #[error("voice.qwen.input_sample_rate must be 16000, got {0}")]
     InvalidInputSampleRate(u32),
-    #[error("voice.qwen.output_sample_rate must be 24000, got {0}")]
+    #[error("voice.qwen.output_sample_rate must be 48000 for WebRTC Opus, got {0}")]
     InvalidOutputSampleRate(u32),
     #[error("voice.qwen.connect_timeout_s must be finite and greater than zero")]
     InvalidConnectTimeout,
@@ -175,6 +179,8 @@ pub enum RealtimeVoiceConfigError {
     InvalidToolLimit,
     #[error("voice.qwen.api_key is required when voice.runtime is native_qwen")]
     MissingApiKey,
+    #[error("voice.qwen.url must replace {{WorkspaceId}} with the Bailian workspace ID")]
+    MissingWorkspaceId,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -773,8 +779,9 @@ mod tests {
     fn realtime_voice_defaults_to_legacy_and_validates() {
         let config: RealtimeVoiceConfig = serde_yaml::from_str("{}\n").unwrap();
         assert_eq!(config.runtime, VoiceRuntime::Legacy);
+        assert_eq!(config.qwen.voice, "Tina");
         assert_eq!(config.qwen.input_sample_rate.0, 16_000);
-        assert_eq!(config.qwen.output_sample_rate.0, 24_000);
+        assert_eq!(config.qwen.output_sample_rate.0, 48_000);
         assert_eq!(config.validate(), Ok(()));
     }
 
@@ -784,6 +791,16 @@ mod tests {
         assert_eq!(
             config.validate(),
             Err(RealtimeVoiceConfigError::MissingApiKey)
+        );
+    }
+
+    #[test]
+    fn native_qwen_requires_workspace_scoped_webrtc_url() {
+        let config: RealtimeVoiceConfig =
+            serde_yaml::from_str("runtime: native_qwen\nqwen:\n  api_key: test\n").unwrap();
+        assert_eq!(
+            config.validate(),
+            Err(RealtimeVoiceConfigError::MissingWorkspaceId)
         );
     }
 
@@ -800,7 +817,7 @@ mod tests {
     #[test]
     fn parses_and_validates_native_tool_limits() {
         let config: RealtimeVoiceConfig = serde_yaml::from_str(
-            "runtime: native_qwen\nqwen:\n  api_key: test\n  tool_timeout_s: 2.5\n  max_tool_calls: 3\n  max_tool_iterations: 2\n",
+            "runtime: native_qwen\nqwen:\n  url: https://wsid.cn-beijing.maas.aliyuncs.com/api/v1/webrtc/realtime\n  api_key: test\n  tool_timeout_s: 2.5\n  max_tool_calls: 3\n  max_tool_iterations: 2\n",
         )
         .unwrap();
         assert_eq!(config.qwen.tool_timeout_s, 2.5);
@@ -863,7 +880,7 @@ mod tests {
 
     #[test]
     fn enabled_mcp_accepts_valid_timeout_and_legacy_defaults_stay_unchanged() {
-        let native = "voice:\n  runtime: native_qwen\n  qwen:\n    api_key: test\nmcp:\n  home_assistant:\n    enabled: true\n    timeout_s: 0.25\n";
+        let native = "voice:\n  runtime: native_qwen\n  qwen:\n    url: https://wsid.cn-beijing.maas.aliyuncs.com/api/v1/webrtc/realtime\n    api_key: test\nmcp:\n  home_assistant:\n    enabled: true\n    timeout_s: 0.25\n";
         assert_eq!(
             load_config(native, "valid-native")
                 .expect("valid native MCP timeout rejected")
