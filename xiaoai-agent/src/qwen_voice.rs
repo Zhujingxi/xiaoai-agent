@@ -885,6 +885,48 @@ impl Drop for GenericToolCall {
     }
 }
 
+fn normalize_qwen_tool_schema(schema: &mut Value) -> anyhow::Result<()> {
+    match schema {
+        Value::Object(object) => {
+            let normalized_type = match object.get("type") {
+                Some(Value::Array(types)) => {
+                    anyhow::ensure!(
+                        types.iter().all(Value::is_string),
+                        "tool schema type union contains a non-string value"
+                    );
+                    let concrete_types = types
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|value| *value != "null")
+                        .collect::<HashSet<_>>();
+                    anyhow::ensure!(
+                        concrete_types.len() == 1,
+                        "tool schema type union must contain exactly one non-null type"
+                    );
+                    concrete_types
+                        .into_iter()
+                        .next()
+                        .map(|value| Value::String(value.to_string()))
+                }
+                _ => None,
+            };
+            if let Some(normalized_type) = normalized_type {
+                object.insert("type".to_string(), normalized_type);
+            }
+            for value in object.values_mut() {
+                normalize_qwen_tool_schema(value)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_qwen_tool_schema(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 impl NativeToolRuntime {
     #[cfg(test)]
     async fn load(config: &QwenRealtimeConfig, server: ToolServerHandle) -> anyhow::Result<Self> {
@@ -907,11 +949,18 @@ impl NativeToolRuntime {
                     "tool {} parameters must be a JSON Schema object",
                     definition.name
                 );
+                let mut parameters = definition.parameters;
+                normalize_qwen_tool_schema(&mut parameters).with_context(|| {
+                    format!(
+                        "normalize tool {} schema for Qwen realtime",
+                        definition.name
+                    )
+                })?;
                 Ok(ToolDefinition::Function {
                     function: FunctionDefinition {
                         name: definition.name,
                         description: definition.description,
-                        parameters: definition.parameters,
+                        parameters,
                     },
                 })
             })
@@ -2062,6 +2111,37 @@ mod tests {
     use rmcp::{RoleServer, ServerHandler, ServiceExt};
     use serde::Deserialize;
     use tokio::io::{AsyncRead, ReadBuf};
+
+    #[test]
+    fn qwen_tool_schema_normalizes_nullable_type_unions() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": ["string", "null"]},
+                "limit": {"type": ["null", "integer"], "minimum": 1},
+                "topic": {"type": "string", "enum": ["general", "news"]}
+            }
+        });
+
+        normalize_qwen_tool_schema(&mut schema).unwrap();
+
+        assert_eq!(schema["properties"]["location"]["type"], "string");
+        assert_eq!(schema["properties"]["limit"]["type"], "integer");
+        assert_eq!(schema["properties"]["limit"]["minimum"], 1);
+        assert_eq!(
+            schema["properties"]["topic"]["enum"],
+            json!(["general", "news"])
+        );
+    }
+
+    #[test]
+    fn qwen_tool_schema_rejects_ambiguous_type_unions() {
+        let mut schema = json!({"type": ["string", "integer"]});
+
+        let error = normalize_qwen_tool_schema(&mut schema).unwrap_err();
+
+        assert!(error.to_string().contains("exactly one non-null type"));
+    }
 
     #[derive(Clone)]
     struct MockMcpTool {
