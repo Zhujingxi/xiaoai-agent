@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XiaoAI Agent 配置</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #fff;
+      --text: #1f2937;
+      --muted: #64748b;
+      --border: #dfe3e8;
+      --soft: #f6f8fa;
+      --accent: #356a9a;
+      --accent-dark: #285577;
+      --green: #18794e;
+      --amber: #a15c00;
+      --red: #b42318;
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; }
+    html { font-size: 16px; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 400 1rem/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button, input, select, textarea { font: inherit; }
+    button, input, select, textarea { border-radius: var(--radius); }
+    [hidden] { display: none !important; }
+    main { width: min(100% - 32px, 920px); margin: 0 auto; padding: 28px 0 64px; }
+    header { padding-bottom: 24px; }
+    .header-top { display: flex; flex-wrap: wrap; gap: 16px 24px; align-items: center; justify-content: space-between; }
+    h1, h2, legend, summary { color: #172033; }
+    h1 { margin: 0; font-size: clamp(1.6rem, 4vw, 2rem); line-height: 1.2; }
+    h2 { margin: 0 0 20px; font-size: 1.25rem; line-height: 1.3; }
+    legend { padding: 0; font-size: 1.05rem; font-weight: 700; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    button {
+      min-height: 44px;
+      padding: 9px 16px;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-dark); border-color: var(--accent-dark); }
+    button.secondary { background: #fff; color: var(--accent); }
+    button.danger { border-color: var(--red); color: var(--red); background: #fff; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    :focus-visible { outline: 3px solid #8ab8df; outline-offset: 2px; }
+    .header-status { display: flex; flex-wrap: wrap; gap: 8px 20px; margin: 18px 0 0; color: var(--muted); }
+    .header-status strong { color: var(--text); font-weight: 650; }
+    #status-badge.ok, .ok { color: var(--green); }
+    #status-badge.warn, .warn { color: var(--amber); }
+    #status-badge.error, .error { color: var(--red); }
+    .message { min-height: 24px; margin-top: 14px; color: var(--muted); }
+    .message.success { color: var(--green); }
+    .message.warning { color: var(--amber); }
+    .message.error { color: var(--red); }
+    .card { border-top: 1px solid var(--border); padding: 28px 0 30px; }
+    fieldset { min-width: 0; margin: 0 0 28px; padding: 0; border: 0; }
+    fieldset:last-child { margin-bottom: 0; }
+    .fields { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px 20px; margin-top: 16px; }
+    .field { min-width: 0; }
+    label { display: block; margin-bottom: 6px; font-weight: 650; }
+    input, select, textarea {
+      width: 100%;
+      min-height: 44px;
+      padding: 9px 11px;
+      border: 1px solid #cbd2d9;
+      background: #fff;
+      color: var(--text);
+    }
+    textarea { min-height: 96px; resize: vertical; }
+    input:disabled, select:disabled, textarea:disabled { background: var(--soft); }
+    [aria-invalid="true"] { border-color: var(--red); }
+    .check-field { display: grid; grid-template-columns: 24px 1fr; align-items: start; gap: 8px; padding-top: 7px; }
+    .check-field input { width: 20px; min-height: 20px; margin: 2px 0 0; }
+    .check-field label { margin: 0; }
+    .secret-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+    .secret-row button { min-width: 72px; }
+    .provider-panel { margin-top: 18px; padding-left: 16px; border-left: 3px solid var(--border); }
+    .provider-panel h3 { margin: 0; font-size: 1rem; }
+    .helper { margin: 6px 0 0; color: var(--muted); font-size: .875rem; }
+    .field-error { margin: 6px 0 0; color: var(--red); font-size: .875rem; }
+    .check-field .field-error { grid-column: 1 / -1; }
+    .status-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; margin: 0; border-top: 1px solid var(--border); }
+    .status-list div { padding: 12px 0; border-bottom: 1px solid var(--border); }
+    .status-list dt { color: var(--muted); font-size: .875rem; }
+    .status-list dd { margin: 3px 0 0; font-weight: 650; overflow-wrap: anywhere; }
+    details { border: 1px solid var(--border); border-radius: var(--radius); }
+    summary { padding: 13px 16px; font-weight: 700; cursor: pointer; }
+    .advanced-content { padding: 2px 16px 18px; }
+    #advanced-json > dl { margin-top: 0; }
+    #advanced-json dl { display: grid; grid-template-columns: minmax(120px, .45fr) minmax(0, 1fr); margin: 8px 0; }
+    #advanced-json dt, #advanced-json dd { padding: 5px 8px; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+    #advanced-json dt { color: var(--muted); }
+    #advanced-json dd { margin: 0; }
+    .logs-heading { margin: 22px 0 8px; font-size: 1rem; }
+    pre { max-height: 340px; margin: 0; padding: 14px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--soft); font: .8125rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
+    @media (min-width: 721px) {
+      .fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .span-2 { grid-column: 1 / -1; }
+      .status-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width: 480px) {
+      main { width: min(100% - 24px, 920px); padding-top: 20px; }
+      .actions, .actions button { width: 100%; }
+      .status-list { grid-template-columns: 1fr; }
+      .secret-row { grid-template-columns: 1fr; }
+      #advanced-json dl { grid-template-columns: 1fr; }
+      #advanced-json dt { border-bottom: 0; padding-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="header-top">
+      <h1>XiaoAI Agent 配置</h1>
+      <div class="actions">
+        <button id="save-button" type="submit" form="config-form">保存配置</button>
+        <button id="restart-button" class="danger" type="button">重启服务</button>
+      </div>
+    </div>
+    <div class="header-status" aria-label="服务摘要">
+      <span>状态：<strong id="status-badge">正在连接</strong></span>
+      <span>版本：<strong id="version">—</strong></span>
+      <span>运行时间：<strong id="uptime">—</strong></span>
+      <span>配置：<strong id="config-state">正在读取</strong></span>
+    </div>
+    <div id="message" class="message" role="status" aria-live="polite"></div>
+  </header>
+
+  <form id="config-form">
+    <section class="card" aria-labelledby="status-title">
+      <h2 id="status-title">运行状态</h2>
+      <dl class="status-list">
+        <div><dt>唤醒服务</dt><dd id="kws-status">—</dd></div>
+        <div><dt>当前会话</dt><dd id="turn-status">—</dd></div>
+        <div><dt>语音运行时</dt><dd id="voice-status">—</dd></div>
+        <div><dt>语音识别</dt><dd id="asr-status">—</dd></div>
+        <div class="span-2"><dt>最近错误</dt><dd id="last-error">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="card" aria-labelledby="voice-model-title">
+      <h2 id="voice-model-title">语音与模型</h2>
+      <fieldset>
+        <legend>语音</legend>
+        <div class="fields">
+          <div class="field">
+            <label for="voice-runtime">运行模式</label>
+            <select id="voice-runtime" data-path="voice.runtime">
+              <option value="legacy">传统流水线</option>
+              <option value="native_qwen">Qwen 实时语音</option>
+            </select>
+          </div>
+        </div>
+        <div class="provider-panel" data-provider-section="native_qwen" hidden>
+          <h3>Qwen 实时语音</h3>
+          <div class="fields">
+            <div class="field span-2"><label for="qwen-url">服务 URL</label><input id="qwen-url" type="url" required pattern="wss://.*" data-path="voice.qwen.url"></div>
+            <div class="field span-2"><label for="qwen-key">API 密钥</label><div class="secret-row"><input id="qwen-key" type="password" autocomplete="new-password" data-secret-path="voice.qwen.api_key"><button class="danger" type="button" data-clear-secret="voice.qwen.api_key" aria-label="清除 Qwen API 密钥">清除</button></div></div>
+            <div class="field"><label for="qwen-model">模型</label><input id="qwen-model" required data-path="voice.qwen.model"></div>
+            <div class="field"><label for="qwen-voice">音色</label><input id="qwen-voice" required data-path="voice.qwen.voice"></div>
+            <div class="field"><label for="qwen-connect-timeout">连接超时（秒）</label><input id="qwen-connect-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.connect_timeout_s"></div>
+            <div class="field"><label for="qwen-event-timeout">事件超时（秒）</label><input id="qwen-event-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.event_timeout_s"></div>
+            <div class="field"><label for="qwen-tool-timeout">工具超时（秒）</label><input id="qwen-tool-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.tool_timeout_s"></div>
+            <div class="field"><label for="qwen-max-tools">每轮最大工具调用数</label><input id="qwen-max-tools" type="number" required min="1" step="1" data-path="voice.qwen.max_tool_calls"></div>
+            <div class="field"><label for="qwen-max-iterations">最大工具迭代数</label><input id="qwen-max-iterations" type="number" required min="1" step="1" data-path="voice.qwen.max_tool_iterations"></div>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>ASR</legend>
+        <div class="fields">
+          <div class="field"><label for="asr-provider">服务提供方</label><select id="asr-provider" data-path="asr.provider"><option value="open_ai">OpenAI 兼容</option><option value="openai_realtime">OpenAI 实时转写</option><option value="xiaomi_aivs">Xiaomi AIVS</option></select></div>
+        </div>
+        <div class="provider-panel" data-provider-section="open_ai" hidden>
+          <h3>OpenAI 兼容 ASR</h3>
+          <div class="fields">
+            <div class="field span-2"><label for="asr-open-base">基础 URL</label><input id="asr-open-base" type="url" data-path="asr.open_ai.base_url"></div>
+            <div class="field span-2"><label for="asr-open-key">API 密钥</label><div class="secret-row"><input id="asr-open-key" type="password" autocomplete="new-password" data-secret-path="asr.open_ai.api_key"><button class="danger" type="button" data-clear-secret="asr.open_ai.api_key" aria-label="清除 OpenAI 兼容 ASR API 密钥">清除</button></div></div>
+            <div class="field"><label for="asr-open-model">模型</label><input id="asr-open-model" data-path="asr.open_ai.model"></div>
+            <div class="field"><label for="asr-open-language">语言</label><input id="asr-open-language" data-path="asr.open_ai.language"></div>
+            <div class="field span-2"><label for="asr-open-prompt">提示词</label><textarea id="asr-open-prompt" data-path="asr.open_ai.prompt"></textarea></div>
+            <div class="field"><label for="asr-open-timeout">超时（秒）</label><input id="asr-open-timeout" type="number" required min="0" step="any" data-positive="true" data-path="asr.open_ai.timeout_s"></div>
+            <div class="field"><label for="asr-open-retries">重试次数</label><input id="asr-open-retries" type="number" required min="0" max="4294967295" step="1" data-path="asr.open_ai.retries"></div>
+          </div>
+        </div>
+        <div class="provider-panel" data-provider-section="openai_realtime" hidden>
+          <h3>OpenAI 实时转写</h3>
+          <div class="fields">
+            <div class="field span-2"><label for="asr-realtime-base">基础 URL</label><input id="asr-realtime-base" type="url" data-path="asr.openai_realtime.base_url"></div>
+            <div class="field span-2"><label for="asr-realtime-key">API 密钥</label><div class="secret-row"><input id="asr-realtime-key" type="password" autocomplete="new-password" data-secret-path="asr.openai_realtime.api_key"><button class="danger" type="button" data-clear-secret="asr.openai_realtime.api_key" aria-label="清除 OpenAI 实时转写 API 密钥">清除</button></div></div>
+            <div class="field"><label for="asr-realtime-model">模型</label><input id="asr-realtime-model" data-path="asr.openai_realtime.model"></div>
+            <div class="field"><label for="asr-realtime-rate">目标采样率</label><input id="asr-realtime-rate" type="number" required min="0" max="4294967295" step="1" data-path="asr.openai_realtime.target_sample_rate"></div>
+            <div class="field"><label for="asr-realtime-chunk">分块时长（毫秒）</label><input id="asr-realtime-chunk" type="number" required min="0" max="4294967295" step="1" data-path="asr.openai_realtime.chunk_ms"></div>
+            <div class="field"><label for="asr-realtime-timeout">超时（秒）</label><input id="asr-realtime-timeout" type="number" required min="0" step="any" data-positive="true" data-path="asr.openai_realtime.timeout_s"></div>
+            <div class="field"><label for="asr-realtime-retries">重试次数</label><input id="asr-realtime-retries" type="number" required min="0" max="4294967295" step="1" data-path="asr.openai_realtime.retries"></div>
+          </div>
+        </div>
+        <div class="provider-panel" data-provider-section="xiaomi_aivs" hidden>
+          <h3>Xiaomi AIVS</h3>
+          <p class="helper">当前参数为只读，请在高级信息中查看。</p>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>LLM</legend>
+        <div class="fields">
+          <div class="field span-2"><label for="llm-base">基础 URL</label><input id="llm-base" type="url" data-path="llm.base_url"></div>
+          <div class="field span-2"><label for="llm-key">API 密钥</label><div class="secret-row"><input id="llm-key" type="password" autocomplete="new-password" data-secret-path="llm.api_key"><button class="danger" type="button" data-clear-secret="llm.api_key" aria-label="清除 LLM API 密钥">清除</button></div></div>
+          <div class="field"><label for="llm-model">模型</label><input id="llm-model" data-path="llm.model"></div>
+          <div class="field"><label for="llm-timeout">超时（秒）</label><input id="llm-timeout" type="number" required min="0" step="any" data-positive="true" data-path="llm.timeout_s"></div>
+          <div class="field"><label for="llm-max-tokens">最大输出令牌数</label><input id="llm-max-tokens" type="number" required min="0" step="1" data-path="llm.max_tokens"></div>
+          <div class="field"><label for="llm-retries">重试次数</label><input id="llm-retries" type="number" required min="0" max="4294967295" step="1" data-path="llm.retries"></div>
+          <div class="field"><label for="llm-temperature">温度</label><input id="llm-temperature" type="number" required step="any" data-path="llm.temperature"></div>
+        </div>
+      </fieldset>
+    </section>
+
+    <section class="card" aria-labelledby="tools-title">
+      <h2 id="tools-title">工具与可选功能</h2>
+      <fieldset>
+        <legend>天气与搜索</legend>
+        <div class="fields">
+          <div class="field span-2"><label for="weather-url">QWeather 请求 URL（可能包含 key）</label><div class="secret-row"><input id="weather-url" type="password" inputmode="url" autocomplete="new-password" data-url-secret="true" data-secret-path="agent.weather.qweather_url"><button class="danger" type="button" data-clear-secret="agent.weather.qweather_url" aria-label="清除 QWeather 请求 URL">清除</button></div></div>
+          <div class="field"><label for="weather-location">默认位置</label><input id="weather-location" data-path="agent.weather.default_location"></div>
+          <div class="field"><label for="weather-ip-url">IP 定位 URL</label><input id="weather-ip-url" type="url" data-path="agent.weather.ip_lookup_url"></div>
+          <div class="field"><label for="weather-timeout">天气超时（秒）</label><input id="weather-timeout" type="number" required min="0" step="any" data-positive="true" data-path="agent.weather.timeout_s"></div>
+          <div class="check-field"><input id="search-enabled" type="checkbox" data-path="agent.web_search.enabled"><label for="search-enabled">启用网页搜索</label></div>
+          <div class="field span-2"><label for="search-url">Tavily URL</label><input id="search-url" type="url" data-path="agent.web_search.tavily_url"></div>
+          <div class="field span-2"><label for="search-key">Tavily API 密钥</label><div class="secret-row"><input id="search-key" type="password" autocomplete="new-password" data-secret-path="agent.web_search.api_key"><button class="danger" type="button" data-clear-secret="agent.web_search.api_key" aria-label="清除 Tavily API 密钥">清除</button></div></div>
+          <div class="field"><label for="search-timeout">搜索超时（秒）</label><input id="search-timeout" type="number" required min="0" step="any" data-positive="true" data-path="agent.web_search.timeout_s"></div>
+          <div class="field"><label for="search-results">最大结果数</label><input id="search-results" type="number" min="1" max="10" step="1" required data-path="agent.web_search.max_results"></div>
+          <div class="field"><label for="search-depth">搜索深度</label><input id="search-depth" data-path="agent.web_search.search_depth"></div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Home Assistant</legend>
+        <div class="fields">
+          <div class="check-field"><input id="ha-enabled" type="checkbox" data-path="home_assistant.enabled"><label for="ha-enabled">启用 Home Assistant</label></div>
+          <div class="field span-2"><label for="ha-url">服务 URL</label><input id="ha-url" type="url" data-path="home_assistant.url"></div>
+          <div class="field span-2"><label for="ha-token">访问令牌</label><div class="secret-row"><input id="ha-token" type="password" autocomplete="new-password" data-secret-path="home_assistant.token"><button class="danger" type="button" data-clear-secret="home_assistant.token" aria-label="清除 Home Assistant 访问令牌">清除</button></div></div>
+          <div class="field"><label for="ha-timeout">超时（秒）</label><input id="ha-timeout" type="number" required min="0" step="any" data-positive="true" data-path="home_assistant.timeout_s"></div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>音乐</legend>
+        <div class="fields">
+          <div class="check-field"><input id="music-enabled" type="checkbox" data-path="music.enabled"><label for="music-enabled">启用音乐</label></div>
+          <div class="field"><label for="music-provider">服务提供方</label><select id="music-provider" data-path="music.provider"><option value="navidrome">Navidrome</option><option value="netease">网易云音乐</option></select></div>
+          <div class="field"><label for="music-interruption">语音打断模式</label><select id="music-interruption" data-path="music.interruption_mode"><option value="pause">暂停</option><option value="duck">降低音量</option><option value="none">不处理</option></select></div>
+        </div>
+        <div class="provider-panel" data-provider-section="navidrome" hidden>
+          <h3>Navidrome</h3>
+          <div class="fields">
+            <div class="field span-2"><label for="navidrome-url">基础 URL</label><input id="navidrome-url" type="url" data-path="music.navidrome.base_url"></div>
+            <div class="field"><label for="navidrome-user">用户名</label><input id="navidrome-user" data-path="music.navidrome.username"></div>
+            <div class="field span-2"><label for="navidrome-password">密码</label><div class="secret-row"><input id="navidrome-password" type="password" autocomplete="new-password" data-secret-path="music.navidrome.password"><button class="danger" type="button" data-clear-secret="music.navidrome.password" aria-label="清除 Navidrome 密码">清除</button></div></div>
+            <div class="field"><label for="navidrome-version">API 版本</label><input id="navidrome-version" data-path="music.navidrome.api_version"></div>
+            <div class="field"><label for="navidrome-timeout">超时（秒）</label><input id="navidrome-timeout" type="number" required min="0" step="any" data-positive="true" data-path="music.navidrome.timeout_s"></div>
+          </div>
+        </div>
+        <div class="provider-panel" data-provider-section="netease" hidden>
+          <h3>网易云音乐</h3>
+          <div class="fields">
+            <div class="field span-2"><label for="netease-url">API 基础 URL</label><input id="netease-url" type="url" data-path="music.netease.api_base_url"></div>
+            <div class="field"><label for="netease-login-mode">登录模式</label><input id="netease-login-mode" data-path="music.netease.login_mode"></div>
+            <div class="field"><label for="netease-account">账号</label><input id="netease-account" data-path="music.netease.account"></div>
+            <div class="field"><label for="netease-phone">手机号</label><input id="netease-phone" data-path="music.netease.phone"></div>
+            <div class="field span-2"><label for="netease-password">密码</label><div class="secret-row"><input id="netease-password" type="password" autocomplete="new-password" data-secret-path="music.netease.password"><button class="danger" type="button" data-clear-secret="music.netease.password" aria-label="清除网易云音乐密码">清除</button></div></div>
+            <div class="field span-2"><label for="netease-md5">MD5 密码</label><div class="secret-row"><input id="netease-md5" type="password" autocomplete="new-password" data-secret-path="music.netease.md5_password"><button class="danger" type="button" data-clear-secret="music.netease.md5_password" aria-label="清除网易云音乐 MD5 密码">清除</button></div></div>
+            <div class="field"><label for="netease-level">默认音质</label><input id="netease-level" data-path="music.netease.default_level"></div>
+            <div class="field"><label for="netease-timeout">超时（秒）</label><input id="netease-timeout" type="number" required min="0" step="any" data-positive="true" data-path="music.netease.timeout_s"></div>
+            <div class="check-field"><input id="netease-login-start" type="checkbox" data-path="music.netease.login_on_start"><label for="netease-login-start">启动时登录</label></div>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>AirPlay</legend>
+        <div class="fields">
+          <div class="check-field"><input id="airplay-enabled" type="checkbox" data-path="airplay.enabled"><label for="airplay-enabled">启用 AirPlay</label></div>
+          <div class="field"><label for="airplay-name">广播名称</label><input id="airplay-name" data-path="airplay.name"></div>
+          <div class="field"><label for="airplay-port">端口</label><input id="airplay-port" type="number" min="1" max="65535" step="1" required data-path="airplay.port"></div>
+          <div class="field span-2"><label for="airplay-password">密码</label><div class="secret-row"><input id="airplay-password" type="password" autocomplete="new-password" data-secret-path="airplay.password"><button class="danger" type="button" data-clear-secret="airplay.password" aria-label="清除 AirPlay 密码">清除</button></div></div>
+          <div class="field"><label for="airplay-interruption">语音打断模式</label><select id="airplay-interruption" data-path="airplay.interruption_mode"><option value="duck">降低音量</option><option value="none">不处理</option></select></div>
+          <div class="field"><label for="airplay-gain">降低后增益</label><input id="airplay-gain" type="number" min="0" max="1" step="any" required data-path="airplay.duck_gain"></div>
+        </div>
+      </fieldset>
+    </section>
+
+    <section class="card" aria-labelledby="general-title">
+      <h2 id="general-title">常规设置</h2>
+      <fieldset>
+        <legend>常规</legend>
+        <div class="fields">
+          <div class="field span-2"><label for="acknowledge-text">唤醒回应语</label><textarea id="acknowledge-text" data-path="runtime.acknowledge_text" data-list="true" aria-describedby="acknowledge-help"></textarea><p class="helper" id="acknowledge-help">每行或用逗号分隔一条回应语。</p></div>
+          <div class="field"><label for="idle-timeout">会话空闲超时（秒）</label><input id="idle-timeout" type="number" required min="0" step="any" data-positive="true" data-path="runtime.session_idle_timeout_s"></div>
+          <div class="field"><label for="timezone">时区</label><input id="timezone" data-path="agent.timezone"></div>
+          <div class="check-field"><input id="led-enabled" type="checkbox" data-path="led_enabled"><label for="led-enabled">启用状态灯</label></div>
+        </div>
+      </fieldset>
+    </section>
+
+    <section class="card" aria-labelledby="advanced-title">
+      <h2 id="advanced-title">高级与调试信息</h2>
+      <details id="advanced">
+        <summary>查看只读配置与最近日志</summary>
+        <div class="advanced-content">
+          <div id="advanced-json" aria-label="只读高级配置"></div>
+          <h3 class="logs-heading">最近日志</h3>
+          <pre id="logs" tabindex="0">打开后读取最近日志。</pre>
+        </div>
+      </details>
+    </section>
+  </form>
+</main>
+
+<script>
+  "use strict";
+
+  const RESTART_TIMEOUT_MS = 30000;
+  const RESTART_POLL_MS = 1000;
+  const RESTART_RECOVERY_HINT = "30 秒内未确认重启。请通过 SSH 检查服务，必要时使用备份配置恢复。";
+  const pageState = {
+    config: null,
+    status: null,
+    secrets: {},
+    busy: false,
+    dirty: false,
+    pendingRestart: false,
+    pendingRestartStartedAt: null,
+    statusTimer: null,
+    logsTimer: null,
+    statusLoading: false,
+    logsLoading: false
+  };
+
+  const byId = (id) => document.getElementById(id);
+  const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+  async function requestJson(url, options = {}) {
+    const { timeoutMs, ...requestOptions } = options;
+    let timeout = null;
+    if (Number.isFinite(timeoutMs)) {
+      const controller = new AbortController();
+      requestOptions.signal = controller.signal;
+      timeout = window.setTimeout(() => controller.abort(), Math.max(0, timeoutMs));
+    }
+    try {
+      const response = await fetch(url, requestOptions);
+      let body = null;
+      try {
+        body = await response.json();
+      } catch (_error) {
+        body = null;
+      }
+      if (!response.ok) {
+        const error = new Error(body && body.error ? body.error : `请求失败（${response.status}）`);
+        error.field = body && body.field ? body.field : null;
+        throw error;
+      }
+      return body;
+    } finally {
+      if (timeout !== null) window.clearTimeout(timeout);
+    }
+  }
+
+  function getPath(object, path) {
+    return path.split(".").reduce((value, key) => value == null ? undefined : value[key], object);
+  }
+
+  function setPath(object, path, value) {
+    const keys = path.split(".");
+    const last = keys.pop();
+    let target = object;
+    for (const key of keys) {
+      if (!target[key] || typeof target[key] !== "object") target[key] = {};
+      target = target[key];
+    }
+    target[last] = value;
+  }
+
+  async function loadConfig() {
+    const response = await requestJson("/api/config");
+    renderConfig(response);
+    return response;
+  }
+
+  function renderConfig(response) {
+    pageState.config = response;
+    pageState.dirty = false;
+    document.querySelectorAll("[data-path]").forEach((control) => {
+      const value = getPath(response.editable, control.dataset.path);
+      if (control.type === "checkbox") control.checked = Boolean(value);
+      else if (control.dataset.list) control.value = Array.isArray(value) ? value.join("\n") : "";
+      else control.value = value == null ? "" : String(value);
+    });
+
+    pageState.secrets = {};
+    document.querySelectorAll("[data-secret-path]").forEach((control) => {
+      const path = control.dataset.secretPath;
+      const status = getPath(response.editable, path) || {};
+      pageState.secrets[path] = { mode: "keep", value: null };
+      control.value = "";
+      control.placeholder = status.masked || "未配置";
+    });
+
+    renderAdvanced(response.advanced);
+    updateConditionalSections();
+    updateConfigState(Boolean(response.restart_required));
+  }
+
+  function readForm() {
+    const editable = JSON.parse(JSON.stringify(pageState.config.editable));
+    document.querySelectorAll("[data-path]").forEach((control) => {
+      let value;
+      if (control.type === "checkbox") value = control.checked;
+      else if (control.type === "number") value = Number(control.value);
+      else if (control.dataset.list) value = control.value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean);
+      else value = control.value;
+      setPath(editable, control.dataset.path, value);
+    });
+    document.querySelectorAll("[data-secret-path]").forEach((control) => {
+      const secret = pageState.secrets[control.dataset.secretPath] || { mode: "keep", value: null };
+      setPath(editable, control.dataset.secretPath, {
+        mode: secret.mode,
+        value: secret.mode === "replace" ? control.value : null
+      });
+    });
+    return editable;
+  }
+
+  async function saveConfig(event) {
+    event.preventDefault();
+    clearFieldErrors();
+    if (pageState.busy || !pageState.config) return;
+    validateClientConstraints();
+    if (!byId("config-form").reportValidity()) return;
+    setBusy(true);
+    showMessage("正在保存配置…");
+    try {
+      const response = await requestJson("/api/config", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(readForm())
+      });
+      pageState.pendingRestart = true;
+      pageState.pendingRestartStartedAt = pageState.status && pageState.status.started_at_unix_ms;
+      renderConfig(response);
+      showMessage("配置已保存。重启 XiaoAI Agent 后生效。", "success");
+    } catch (error) {
+      const field = normalizeFieldPath(error.field);
+      const prefix = field ? `${field}：` : "";
+      showMessage(`${prefix}${error.message}`, "error");
+      showFieldError(field, "此字段的配置无效，请检查后重试。");
+      focusField(field);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function restartAgent() {
+    if (pageState.busy || !window.confirm("只重启 XiaoAI Agent，不重启音箱。继续吗？")) return;
+    setBusy(true);
+    showMessage("正在请求重启…", "warning");
+    const deadline = Date.now() + RESTART_TIMEOUT_MS;
+    try {
+      const baselineRemaining = deadline - Date.now();
+      if (baselineRemaining <= 0) throw new DOMException("restart deadline reached", "AbortError");
+      try {
+        const baseline = await requestJson("/api/status", { timeoutMs: baselineRemaining });
+        renderStatus(baseline);
+        pageState.status = baseline;
+      } catch (error) {
+        showMessage(`无法读取重启前状态：${error.message}。请确认服务可访问后重试。`, "error");
+        return;
+      }
+      const before = pageState.status.started_at_unix_ms;
+      const postRemaining = deadline - Date.now();
+      if (postRemaining <= 0) throw new DOMException("restart deadline reached", "AbortError");
+      await requestJson("/api/restart", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+        timeoutMs: postRemaining
+      });
+      while (Date.now() < deadline) {
+        await delay(Math.min(RESTART_POLL_MS, deadline - Date.now()));
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        try {
+          const status = await requestJson("/api/status", { timeoutMs: remaining });
+          if (Date.now() < deadline && status.started_at_unix_ms !== before) {
+            pageState.pendingRestart = false;
+            pageState.pendingRestartStartedAt = null;
+            renderStatus(status);
+            showMessage("服务已重启并恢复连接。", "success");
+            return;
+          }
+        } catch (_error) {
+          // A short connection outage is normal while the process replaces itself.
+        }
+      }
+      showMessage(RESTART_RECOVERY_HINT, "error");
+    } catch (error) {
+      if (error.name === "AbortError" || Date.now() >= deadline) showMessage(RESTART_RECOVERY_HINT, "error");
+      else showMessage(`重启请求失败：${error.message}。${RESTART_RECOVERY_HINT}`, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function refreshStatus() {
+    if (document.hidden || pageState.statusLoading) return;
+    pageState.statusLoading = true;
+    try {
+      renderStatus(await requestJson("/api/status"));
+    } catch (error) {
+      byId("status-badge").textContent = "连接中断";
+      byId("status-badge").className = "error";
+    } finally {
+      pageState.statusLoading = false;
+    }
+  }
+
+  async function refreshLogs() {
+    if (document.hidden || !byId("advanced").open || pageState.logsLoading) return;
+    pageState.logsLoading = true;
+    try {
+      const response = await requestJson("/api/logs?limit=200");
+      byId("logs").textContent = response.entries.length ? response.entries.join("\n") : "暂无日志。";
+    } catch (error) {
+      byId("logs").textContent = `日志读取失败：${error.message}`;
+    } finally {
+      pageState.logsLoading = false;
+    }
+  }
+
+  function updateConditionalSections() {
+    const selected = {
+      native_qwen: byId("voice-runtime").value,
+      open_ai: byId("asr-provider").value,
+      openai_realtime: byId("asr-provider").value,
+      xiaomi_aivs: byId("asr-provider").value,
+      navidrome: byId("music-provider").value,
+      netease: byId("music-provider").value
+    };
+    document.querySelectorAll("[data-provider-section]").forEach((section) => {
+      section.hidden = selected[section.dataset.providerSection] !== section.dataset.providerSection;
+    });
+  }
+
+  function showMessage(text, kind = "info") {
+    const message = byId("message");
+    message.textContent = text;
+    message.className = `message ${kind}`;
+  }
+
+  function setBusy(busy) {
+    pageState.busy = busy;
+    byId("save-button").disabled = busy;
+    byId("restart-button").disabled = busy;
+    byId("config-form").setAttribute("aria-busy", String(busy));
+  }
+
+  function updateConfigState(restartRequired) {
+    const target = byId("config-state");
+    if (pageState.dirty) {
+      target.textContent = "未保存";
+      target.className = "warn";
+      return;
+    }
+    const effectiveRestartRequired = restartRequired || pageState.pendingRestart;
+    target.textContent = pageState.pendingRestart ? "配置已保存，需重启" : (effectiveRestartRequired ? "需要重启" : "已生效");
+    target.className = effectiveRestartRequired ? "warn" : "ok";
+  }
+
+  function renderStatus(status) {
+    if (pageState.pendingRestart && pageState.pendingRestartStartedAt !== null && status.started_at_unix_ms !== pageState.pendingRestartStartedAt) {
+      pageState.pendingRestart = false;
+      pageState.pendingRestartStartedAt = null;
+    }
+    pageState.status = status;
+    const badge = byId("status-badge");
+    badge.textContent = status.last_error ? "运行异常" : (status.active_turn ? "处理中" : "运行中");
+    badge.className = status.last_error ? "error" : "ok";
+    byId("version").textContent = status.version;
+    byId("uptime").textContent = formatUptime(status.uptime_s);
+    byId("kws-status").textContent = status.kws_started ? "已启动" : "未启动";
+    byId("turn-status").textContent = status.active_turn ? "处理中" : "空闲";
+    byId("voice-status").textContent = status.voice_runtime;
+    byId("asr-status").textContent = status.asr_provider;
+    byId("last-error").textContent = status.last_error || "无";
+    updateConfigState(Boolean(status.restart_required));
+  }
+
+  function formatUptime(seconds) {
+    const total = Number(seconds) || 0;
+    const days = Math.floor(total / 86400);
+    const hours = Math.floor((total % 86400) / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    return [days ? `${days} 天` : "", hours ? `${hours} 小时` : "", `${minutes} 分钟`].filter(Boolean).join(" ");
+  }
+
+  function renderAdvanced(value) {
+    const root = byId("advanced-json");
+    root.replaceChildren(createDefinitionList(value));
+  }
+
+  function createDefinitionList(value) {
+    const list = document.createElement("dl");
+    Object.entries(value || {}).forEach(([key, item]) => {
+      const term = document.createElement("dt");
+      const detail = document.createElement("dd");
+      term.textContent = key;
+      if (item && typeof item === "object" && !Array.isArray(item)) detail.append(createDefinitionList(item));
+      else detail.textContent = Array.isArray(item) ? item.join(", ") : String(item == null ? "" : item);
+      list.append(term, detail);
+    });
+    return list;
+  }
+
+  function normalizeFieldPath(path) {
+    if (!path) return null;
+    if (path.startsWith("mcp.home_assistant.")) return path.replace("mcp.home_assistant.", "home_assistant.");
+    const aliases = {
+      "music.interruption.mode": "music.interruption_mode",
+      "airplay.interruption.mode": "airplay.interruption_mode",
+      "airplay.interruption.duck_gain": "airplay.duck_gain",
+      "device.led_enabled": "led_enabled"
+    };
+    return aliases[path] || path;
+  }
+
+  function findField(path) {
+    const normalized = normalizeFieldPath(path);
+    return Array.from(document.querySelectorAll("[data-path], [data-secret-path]")).find((item) => item.dataset.path === normalized || item.dataset.secretPath === normalized);
+  }
+
+  function clearFieldError(control) {
+    if (!control) return;
+    const errorId = control.dataset.fieldErrorId;
+    if (errorId) {
+      byId(errorId)?.remove();
+      const describedBy = (control.getAttribute("aria-describedby") || "").split(/\s+/).filter((id) => id && id !== errorId);
+      if (describedBy.length) control.setAttribute("aria-describedby", describedBy.join(" "));
+      else control.removeAttribute("aria-describedby");
+      delete control.dataset.fieldErrorId;
+    }
+    control.removeAttribute("aria-invalid");
+  }
+
+  function clearFieldErrors() {
+    document.querySelectorAll("[aria-invalid='true']").forEach(clearFieldError);
+  }
+
+  function showFieldError(path, text) {
+    const control = findField(path);
+    if (!control) return;
+    clearFieldError(control);
+    const error = document.createElement("p");
+    const errorId = `${control.id}-field-error`;
+    error.id = errorId;
+    error.className = "field-error";
+    error.textContent = text;
+    control.closest(".field, .check-field")?.append(error);
+    control.dataset.fieldErrorId = errorId;
+    control.setAttribute("aria-invalid", "true");
+    const describedBy = (control.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+    if (!describedBy.includes(errorId)) describedBy.push(errorId);
+    control.setAttribute("aria-describedby", describedBy.join(" "));
+  }
+
+  function validateClientConstraints() {
+    document.querySelectorAll("[data-positive]").forEach((control) => {
+      const value = Number(control.value);
+      control.setCustomValidity(Number.isFinite(value) && value > 0 ? "" : "请输入大于 0 的数值。");
+    });
+    document.querySelectorAll("[data-url-secret]").forEach((control) => {
+      const secret = pageState.secrets[control.dataset.secretPath];
+      let valid = true;
+      if (secret && secret.mode === "replace" && control.value) {
+        try { new URL(control.value); } catch (_error) { valid = false; }
+      }
+      control.setCustomValidity(valid ? "" : "请输入完整的 URL。");
+    });
+    return byId("config-form").checkValidity();
+  }
+
+  function markDirty() {
+    if (!pageState.config) return;
+    pageState.dirty = true;
+    updateConfigState(Boolean(pageState.status && pageState.status.restart_required));
+  }
+
+  function focusField(path) {
+    const control = findField(path);
+    if (control) control.focus();
+  }
+
+  function clearSecret(path) {
+    if (!window.confirm("确认清除这个已保存的密钥或密码吗？")) return;
+    const control = Array.from(document.querySelectorAll("[data-secret-path]")).find((item) => item.dataset.secretPath === path);
+    if (!control) return;
+    control.value = "";
+    pageState.secrets[path] = { mode: "clear", value: null };
+    clearFieldError(control);
+    markDirty();
+    showMessage("已标记为清除；保存配置后生效。", "warning");
+  }
+
+  function startPolling() {
+    stopPolling();
+    if (document.hidden) return;
+    pageState.statusTimer = window.setInterval(refreshStatus, 5000);
+    pageState.logsTimer = window.setInterval(refreshLogs, 5000);
+  }
+
+  function stopPolling() {
+    window.clearInterval(pageState.statusTimer);
+    window.clearInterval(pageState.logsTimer);
+    pageState.statusTimer = null;
+    pageState.logsTimer = null;
+  }
+
+  byId("config-form").addEventListener("submit", saveConfig);
+  byId("restart-button").addEventListener("click", restartAgent);
+  byId("voice-runtime").addEventListener("change", updateConditionalSections);
+  byId("asr-provider").addEventListener("change", updateConditionalSections);
+  byId("music-provider").addEventListener("change", updateConditionalSections);
+  byId("advanced").addEventListener("toggle", refreshLogs);
+  byId("config-form").addEventListener("input", (event) => {
+    const control = event.target.closest("[data-path], [data-secret-path]");
+    if (!control) return;
+    control.setCustomValidity("");
+    clearFieldError(control);
+    markDirty();
+  });
+  byId("config-form").addEventListener("change", (event) => {
+    const control = event.target.closest("[data-path], [data-secret-path]");
+    if (!control) return;
+    control.setCustomValidity("");
+    clearFieldError(control);
+    markDirty();
+  });
+  document.querySelectorAll("[data-secret-path]").forEach((control) => {
+    control.addEventListener("input", () => {
+      pageState.secrets[control.dataset.secretPath] = control.value ? { mode: "replace", value: null } : { mode: "keep", value: null };
+    });
+  });
+  document.querySelectorAll("[data-clear-secret]").forEach((button) => {
+    button.addEventListener("click", () => clearSecret(button.dataset.clearSecret));
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopPolling();
+    else {
+      refreshStatus();
+      refreshLogs();
+      startPolling();
+    }
+  });
+
+  Promise.all([loadConfig(), refreshStatus()]).catch((error) => showMessage(`页面初始化失败：${error.message}`, "error"));
+  startPolling();
+</script>
+</body>
+</html>

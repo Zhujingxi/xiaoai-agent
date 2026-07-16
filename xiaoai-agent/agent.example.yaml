@@ -1,3 +1,6 @@
+# The lightweight Web UI listens on 0.0.0.0:8080 by default.
+# Override it with --web-bind / --web-port; Web settings are CLI-only and
+# saved agent.yaml changes take effect only after restarting xiaoai-agent.
 runtime:
   kws_vpm_lib: /usr/lib/libvpm.so
   kws_vpm_config_dir: /usr/share/mipns/vpm/json_segment

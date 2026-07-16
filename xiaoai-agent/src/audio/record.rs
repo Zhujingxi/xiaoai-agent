@@ -149,7 +149,7 @@ fn transform_stream_chunk(
 }
 
 fn convert_a113_s32_to_s16(chunk: &[u8]) -> Vec<u8> {
-    if chunk.len() % 4 != 0 {
+    if !chunk.len().is_multiple_of(4) {
         return Vec::new();
     }
 

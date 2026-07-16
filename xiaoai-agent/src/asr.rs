@@ -38,7 +38,7 @@ use crate::vad::BYTES_PER_SAMPLE;
 pub enum AsrClient {
     OpenAi(OpenAiAsr),
     OpenAiRealtime(OpenAiRealtimeAsr),
-    XiaomiAivs(XiaomiAivsAsr),
+    XiaomiAivs(Box<XiaomiAivsAsr>),
 }
 
 impl AsrClient {
@@ -48,7 +48,7 @@ impl AsrClient {
             AsrProvider::OpenAiRealtime => {
                 Self::OpenAiRealtime(OpenAiRealtimeAsr::new(config.openai_realtime))
             }
-            AsrProvider::XiaomiAivs => Self::XiaomiAivs(XiaomiAivsAsr::new(config)),
+            AsrProvider::XiaomiAivs => Self::XiaomiAivs(Box::new(XiaomiAivsAsr::new(config))),
         })
     }
 
@@ -528,7 +528,7 @@ fn resample_pcm16_mono_linear(
     target_sample_rate: u32,
 ) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
-        pcm.len() % BYTES_PER_SAMPLE == 0,
+        pcm.len().is_multiple_of(BYTES_PER_SAMPLE),
         "PCM16 byte length is odd"
     );
     anyhow::ensure!(sample_rate > 0, "sample_rate must be positive");
@@ -821,17 +821,17 @@ impl AivsSdk {
             .get::<AivsConfigPutString>(
                 b"_ZN4aivs10AivsConfig9putStringERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES8_",
             )?;
-        let client_info_vtable = symbol_address(&library, b"_ZTVN4aivs8Settings10ClientInfoE")?;
+        let client_info_vtable = symbol_address(library, b"_ZTVN4aivs8Settings10ClientInfoE")?;
         let auth_capability_name =
-            symbol_address(&library, b"_ZN4aivs14AuthCapability4NAMEB5cxx11E")?;
+            symbol_address(library, b"_ZN4aivs14AuthCapability4NAMEB5cxx11E")?;
         let connection_capability_name =
-            symbol_address(&library, b"_ZN4aivs20ConnectionCapability4NAMEB5cxx11E")?;
+            symbol_address(library, b"_ZN4aivs20ConnectionCapability4NAMEB5cxx11E")?;
         let instruction_capability_name =
-            symbol_address(&library, b"_ZN4aivs21InstructionCapability4NAMEB5cxx11E")?;
+            symbol_address(library, b"_ZN4aivs21InstructionCapability4NAMEB5cxx11E")?;
         let storage_capability_name =
-            symbol_address(&library, b"_ZN4aivs17StorageCapability4NAMEB5cxx11E")?;
+            symbol_address(library, b"_ZN4aivs17StorageCapability4NAMEB5cxx11E")?;
         let error_capability_name =
-            symbol_address(&library, b"_ZN4aivs15ErrorCapability4NAMEB5cxx11E")?;
+            symbol_address(library, b"_ZN4aivs15ErrorCapability4NAMEB5cxx11E")?;
 
         Ok(Self {
             _library: library,
@@ -1059,7 +1059,6 @@ fn register_capabilities(engine: *mut ()) -> anyhow::Result<()> {
         }
     }
 
-    mem::forget(caps);
     Ok(())
 }
 

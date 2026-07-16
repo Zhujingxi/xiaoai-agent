@@ -16,8 +16,10 @@ mod shell;
 mod tools;
 mod vad;
 mod weather;
+mod web;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +30,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::agent::AgentRuntime;
@@ -50,11 +53,18 @@ const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，�
 struct Cli {
     #[arg(short, long, default_value = "/data/open-xiaoai/agent.yaml")]
     config: PathBuf,
+
+    #[arg(long, default_value = "0.0.0.0")]
+    web_bind: std::net::IpAddr,
+
+    #[arg(long, default_value_t = 8080)]
+    web_port: u16,
 }
 
 struct ActiveTurn {
     task: JoinHandle<()>,
     native_session: Option<SessionHandle>,
+    preserve_active_status: Arc<AtomicBool>,
 }
 
 impl ActiveTurn {
@@ -62,7 +72,8 @@ impl ActiveTurn {
         self.task.is_finished()
     }
 
-    async fn cancel(mut self) {
+    async fn cancel_for_replacement(mut self) {
+        self.preserve_active_status.store(true, Ordering::SeqCst);
         if let Some(session) = self.native_session.take() {
             let _ = session.cancel().await;
             if let Err(err) = self.task.await {
@@ -84,8 +95,13 @@ impl ActiveTurn {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let log_buffer = crate::web::status::LogBuffer::new(200, 2048);
+    let web_log_writer = log_buffer
+        .clone()
+        .with_filter(|metadata| metadata.target() == "xiaoai_agent::web_status");
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr.and(web_log_writer))
         .init();
 
     let cli = Cli::parse();
@@ -108,6 +124,38 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (kws_tx, mut kws_rx) = mpsc::channel::<KwsMonitorEvent>(16);
+    let restart_required = Arc::new(AtomicBool::new(false));
+    let status = Arc::new(crate::web::status::RuntimeStatus::new(
+        config.clone(),
+        log_buffer,
+        restart_required.clone(),
+    ));
+    let store = Arc::new(crate::web::config_store::ConfigStore::new(
+        cli.config.clone(),
+        restart_required,
+    ));
+    let restarter = Arc::new(crate::web::restart::ProcessRestarter::current()?);
+    let listener = tokio::net::TcpListener::bind((cli.web_bind, cli.web_port))
+        .await
+        .with_context(|| format!("failed to bind web UI on {}:{}", cli.web_bind, cli.web_port))?;
+    let web_address = listener
+        .local_addr()
+        .context("failed to inspect bound web UI address")?;
+    info!(%web_address, "web UI listening");
+    let web_state = crate::web::WebState {
+        store,
+        status: status.clone(),
+        restarter,
+    };
+    let web_status = status.clone();
+    let _web_task = tokio::spawn(async move {
+        if let Err(error) = crate::web::serve(listener, web_state).await {
+            web_status.set_last_error(error.to_string());
+            error!(target: "xiaoai_agent::web_status", "web UI stopped");
+            error!("web UI stopped: {error}");
+        }
+    });
+
     let mut kws = KwsMonitor::new();
     start_kws_monitor(&mut kws, config.runtime.clone(), kws_tx.clone()).await;
 
@@ -124,11 +172,15 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             Some(event) = kws_rx.recv() => {
                 match event {
-                    KwsMonitorEvent::Started => info!("KWS monitor started"),
+                    KwsMonitorEvent::Started => {
+                        status.set_kws_started(true);
+                        info!(target: "xiaoai_agent::web_status", "KWS ready");
+                        info!("KWS monitor started");
+                    }
                     KwsMonitorEvent::Keyword(keyword) => {
                         info!("WAKE keyword={keyword}");
                         if let Some(turn) = active_turn.take() {
-                            turn.cancel().await;
+                            turn.cancel_for_replacement().await;
                         }
                         let _ = AudioRecorder::instance().stop_recording().await;
                         let music_interrupted = music.interrupt_for_wake().await;
@@ -139,23 +191,52 @@ async fn main() -> anyhow::Result<()> {
                         cleanup_turn_leds(&device, &config.device).await;
                         agent.reset_session("wake keyword").await;
 
-                        active_turn = if let Some(qwen) = qwen_voice.clone() {
+                        if let Some(qwen) = qwen_voice.clone() {
                             let device = device.clone();
                             let device_config = config.device.clone();
                             let idle_timeout = Duration::from_secs_f64(
                                 config.runtime.session_idle_timeout_s.max(1.0),
                             );
-                            let session = qwen.prepare_session(idle_timeout)?;
+                            let session = match qwen.prepare_session(idle_timeout) {
+                                Ok(session) => session,
+                                Err(error) => {
+                                    status.set_active_turn(false);
+                                    status.set_last_error(error.to_string());
+                                    error!(target: "xiaoai_agent::web_status", "native Qwen voice session failed");
+                                    error!("failed to prepare native Qwen voice session: {error:?}");
+                                    continue;
+                                }
+                            };
                             let native_session = session.handle();
-                            Some(ActiveTurn {
+                            let turn_status = status.clone();
+                            let preserve_active_status = Arc::new(AtomicBool::new(false));
+                            let task_preserve_active_status = preserve_active_status.clone();
+                            info!(target: "xiaoai_agent::web_status", "voice turn started");
+                            status.set_active_turn(true);
+                            active_turn = Some(ActiveTurn {
                                 task: tokio::spawn(async move {
-                                    if let Err(err) = session.run().await {
-                                        error!("native Qwen voice session failed: {err:?}");
-                                    }
+                                    let result = session.run().await;
                                     cleanup_turn_leds(&device, &device_config).await;
+                                    match result {
+                                        Ok(()) => {
+                                            if !task_preserve_active_status.load(Ordering::SeqCst) {
+                                                turn_status.clear_last_error();
+                                            }
+                                        }
+                                        Err(error) => {
+                                            turn_status.set_last_error(error.to_string());
+                                            error!(target: "xiaoai_agent::web_status", "native Qwen voice session failed");
+                                            error!("native Qwen voice session failed: {error:?}");
+                                        }
+                                    }
+                                    if !task_preserve_active_status.load(Ordering::SeqCst) {
+                                        turn_status.set_active_turn(false);
+                                    }
+                                    info!(target: "xiaoai_agent::web_status", "voice turn finished");
                                 }),
                                 native_session: Some(native_session),
-                            })
+                                preserve_active_status,
+                            });
                         } else {
                             let state = TurnState {
                                 config: config.clone(),
@@ -165,15 +246,34 @@ async fn main() -> anyhow::Result<()> {
                                 music: music.clone(),
                                 airplay: airplay.clone(),
                             };
-                            Some(ActiveTurn {
+                            let turn_status = status.clone();
+                            let preserve_active_status = Arc::new(AtomicBool::new(false));
+                            let task_preserve_active_status = preserve_active_status.clone();
+                            info!(target: "xiaoai_agent::web_status", "voice turn started");
+                            status.set_active_turn(true);
+                            active_turn = Some(ActiveTurn {
                                 task: tokio::spawn(async move {
-                                    if let Err(err) = run_turn(state).await {
-                                        error!("turn failed: {err:?}");
+                                    match run_turn(state).await {
+                                        Ok(()) => {
+                                            if !task_preserve_active_status.load(Ordering::SeqCst) {
+                                                turn_status.clear_last_error();
+                                            }
+                                        }
+                                        Err(error) => {
+                                            turn_status.set_last_error(error.to_string());
+                                            error!(target: "xiaoai_agent::web_status", "legacy voice turn failed");
+                                            error!("turn failed: {error:?}");
+                                        }
                                     }
+                                    if !task_preserve_active_status.load(Ordering::SeqCst) {
+                                        turn_status.set_active_turn(false);
+                                    }
+                                    info!(target: "xiaoai_agent::web_status", "voice turn finished");
                                 }),
                                 native_session: None,
-                            })
-                        };
+                                preserve_active_status,
+                            });
+                        }
                     }
                 }
             }
@@ -186,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(handle) = active_turn.take() {
                         handle.join().await;
                     }
+                    status.set_active_turn(false);
                     device
                         .blink_ready(config.device.led_listening, Duration::from_millis(250))
                         .await;
@@ -421,6 +522,30 @@ fn build_qwen_voice_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_cli_defaults_to_lan_port_8080() {
+        let cli = Cli::try_parse_from(["xiaoai-agent"]).unwrap();
+        assert_eq!(cli.web_bind, "0.0.0.0".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(cli.web_port, 8080);
+    }
+
+    #[test]
+    fn web_cli_accepts_loopback_and_custom_port() {
+        let cli = Cli::try_parse_from([
+            "xiaoai-agent",
+            "--web-bind",
+            "127.0.0.1",
+            "--web-port",
+            "18080",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.web_bind,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(cli.web_port, 18080);
+    }
 
     #[test]
     fn voice_runtime_routes_legacy_and_native_behavior_separately() {
