@@ -86,6 +86,10 @@ pub struct SessionUpdate {
     pub voice: String,
     pub input_audio_format: AudioFormat,
     pub output_audio_format: AudioFormat,
+    /// `None` is serialized as JSON `null`, which explicitly selects manual
+    /// turn detection. Omitting this field would enable Qwen's server VAD.
+    #[serde(default)]
+    pub turn_detection: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -392,6 +396,7 @@ mod tests {
 
         assert_eq!(session.input_audio_format, AudioFormat::Pcm);
         assert_eq!(session.output_audio_format, AudioFormat::Pcm);
+        assert!(session.turn_detection.is_some());
         let ToolDefinition::Function { function } = &session.tools[0];
         assert_eq!(function.name, "get_current_weather");
         assert_eq!(

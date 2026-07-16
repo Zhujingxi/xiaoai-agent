@@ -1422,6 +1422,7 @@ async fn run_connected_session(
                 voice: config.voice.clone(),
                 input_audio_format: AudioFormat::Pcm,
                 output_audio_format: AudioFormat::Pcm,
+                turn_detection: None,
                 instructions: Some(SPEAKER_AGENT_INSTRUCTIONS.to_string()),
                 tools: tools.definitions.clone(),
             },
@@ -2141,6 +2142,26 @@ mod tests {
         let error = normalize_qwen_tool_schema(&mut schema).unwrap_err();
 
         assert!(error.to_string().contains("exactly one non-null type"));
+    }
+
+    #[test]
+    fn native_qwen_session_uses_manual_turn_detection() {
+        let event = ClientEvent::SessionUpdate {
+            event_id: None,
+            session: SessionUpdate {
+                modalities: vec![Modality::Text, Modality::Audio],
+                voice: "Cherry".to_string(),
+                input_audio_format: AudioFormat::Pcm,
+                output_audio_format: AudioFormat::Pcm,
+                turn_detection: None,
+                instructions: None,
+                tools: Vec::new(),
+            },
+        };
+
+        let value = serde_json::to_value(event).unwrap();
+
+        assert!(value["session"]["turn_detection"].is_null());
     }
 
     #[derive(Clone)]
