@@ -4799,6 +4799,7 @@ dependencies = [
  "reqwest",
  "rig-core",
  "rmcp",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",

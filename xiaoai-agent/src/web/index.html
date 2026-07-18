@@ -164,10 +164,12 @@
         <div class="provider-panel" data-provider-section="native_qwen" hidden>
           <h3>Qwen 实时语音</h3>
           <div class="fields">
-            <div class="field span-2"><label for="qwen-url">服务 URL</label><input id="qwen-url" type="url" required pattern="wss://.*" data-path="voice.qwen.url"></div>
+            <div class="field span-2"><label for="qwen-url">WebRTC 信令 URL</label><input id="qwen-url" type="url" required pattern="https://.*" data-path="voice.qwen.url"></div>
             <div class="field span-2"><label for="qwen-key">API 密钥</label><div class="secret-row"><input id="qwen-key" type="password" autocomplete="new-password" data-secret-path="voice.qwen.api_key"><button class="danger" type="button" data-clear-secret="voice.qwen.api_key" aria-label="清除 Qwen API 密钥">清除</button></div></div>
             <div class="field"><label for="qwen-model">模型</label><input id="qwen-model" required data-path="voice.qwen.model"></div>
             <div class="field"><label for="qwen-voice">音色</label><input id="qwen-voice" required data-path="voice.qwen.voice"></div>
+            <div class="field"><label for="qwen-vad-threshold">语音检测阈值</label><input id="qwen-vad-threshold" type="number" required min="-1" max="1" step="0.05" data-path="voice.qwen.turn_detection_threshold"><small>安静环境可降低，嘈杂环境应提高。</small></div>
+            <div class="field"><label for="qwen-vad-silence">结束静音（毫秒）</label><input id="qwen-vad-silence" type="number" required min="200" max="6000" step="50" data-path="voice.qwen.turn_detection_silence_duration_ms"><small>500 ms 为低延迟默认值；过低会切断自然停顿。</small></div>
             <div class="field"><label for="qwen-connect-timeout">连接超时（秒）</label><input id="qwen-connect-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.connect_timeout_s"></div>
             <div class="field"><label for="qwen-event-timeout">事件超时（秒）</label><input id="qwen-event-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.event_timeout_s"></div>
             <div class="field"><label for="qwen-tool-timeout">工具超时（秒）</label><input id="qwen-tool-timeout" type="number" required min="0" step="any" data-positive="true" data-path="voice.qwen.tool_timeout_s"></div>
@@ -309,6 +311,7 @@
           <div class="field"><label for="idle-timeout">会话空闲超时（秒）</label><input id="idle-timeout" type="number" required min="0" step="any" data-positive="true" data-path="runtime.session_idle_timeout_s"></div>
           <div class="field"><label for="timezone">时区</label><input id="timezone" data-path="agent.timezone"></div>
           <div class="check-field"><input id="led-enabled" type="checkbox" data-path="led_enabled"><label for="led-enabled">启用状态灯</label></div>
+          <div class="field span-2"><label for="custom-instructions">自定义提示词</label><textarea id="custom-instructions" data-path="agent.custom_instructions" rows="6" aria-describedby="custom-instructions-help"></textarea><p class="helper" id="custom-instructions-help">追加在内置提示词之后，适合放家庭设备、房间、操作规则等专有约定；请保持简短，每次会话都会携带。</p></div>
         </div>
       </fieldset>
     </section>

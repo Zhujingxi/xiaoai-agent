@@ -20,8 +20,9 @@ pub const SPEAKER_AGENT_INSTRUCTIONS: &str = concat!(
     "你运行在小爱音箱端侧；端侧程序负责语音唤醒、云端 ASR、TTS 和播放控制。",
     "你负责根据用户文本请求完成任务并返回适合朗读的文本。",
     "直接给最终答案，不要输出思考过程。",
-    "回答要自然、简短、适合直接朗读。",
-    "通常只说一到两句话，除非用户明确要求详细解释。",
+    "回答必须极简：默认只说一句话，能更短就更短。",
+    "不要客套话，不要开场白和结束语，不要复述用户的问题，不要事后总结。",
+    "只有用户明确要求详细解释时才展开。",
     "不要使用 Markdown，不要列太长的清单。",
     "当用户询问当前时间、日期、天气或预报时，必须调用工具获得实时信息。",
     "当用户询问新闻、最近发生的事、实时资料，或明确要求上网搜索时，必须调用 web_search 工具。",
@@ -43,8 +44,20 @@ pub const SPEAKER_AGENT_INSTRUCTIONS: &str = concat!(
     "调用 submit_music_login_code 完成登录；登录 cookie 只在本次进程内保存。",
     "当用户表达再见、拜拜、不用了、结束对话、先这样等结束意图时，",
     "必须调用 end_conversation 工具，然后用一句简短自然的告别作为最终回复。",
+    "绝不能在用户没有明确表达结束意图时主动调用 end_conversation；完成任务不等于结束对话。",
     "如果工具返回错误或信息不足，要坦率说明无法确认。"
 );
+
+/// Built-in instructions plus the site-specific rules from
+/// `agent.custom_instructions` (editable via the web UI).
+pub fn speaker_instructions(config: &AppConfig) -> String {
+    let custom = config.agent.custom_instructions.trim();
+    if custom.is_empty() {
+        SPEAKER_AGENT_INSTRUCTIONS.to_string()
+    } else {
+        format!("{SPEAKER_AGENT_INSTRUCTIONS}\n{custom}")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentTurnResult {
@@ -62,7 +75,11 @@ pub struct AgentControl {
 pub struct AgentRuntime {
     config: Arc<AppConfig>,
     tool_server: ToolServerHandle,
-    mcp: McpConnections,
+    // Owned so the legacy Home Assistant MCP connection stays alive.
+    _mcp: McpConnections,
+    native_mcp: std::sync::RwLock<Option<NativeMcpClient>>,
+    native_mcp_generation: std::sync::atomic::AtomicU64,
+    native_mcp_reconnecting: std::sync::atomic::AtomicBool,
     history: Mutex<Vec<(String, String)>>,
     control: Arc<Mutex<AgentControl>>,
 }
@@ -99,10 +116,14 @@ impl AgentRuntime {
             warn!("initial stop_audio failed, continuing: {err:?}");
         }
 
+        let native_mcp = std::sync::RwLock::new(mcp.native_client());
         Ok(Self {
             config,
             tool_server,
-            mcp,
+            _mcp: mcp,
+            native_mcp,
+            native_mcp_generation: std::sync::atomic::AtomicU64::new(0),
+            native_mcp_reconnecting: std::sync::atomic::AtomicBool::new(false),
             history: Mutex::new(Vec::new()),
             control,
         })
@@ -157,7 +178,79 @@ impl AgentRuntime {
     }
 
     pub fn native_mcp_client(&self) -> Option<NativeMcpClient> {
-        self.mcp.native_client()
+        match self.native_mcp.read() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn native_mcp_needs_reconnect(&self) -> bool {
+        if !self.config.mcp.home_assistant.enabled
+            || self.config.voice.runtime == crate::config::VoiceRuntime::Legacy
+        {
+            return false;
+        }
+        match self.native_mcp_client() {
+            // The boot-time connect failed (e.g. network not up yet); the
+            // client never existed and must be established at idle.
+            None => true,
+            Some(client) => client.needs_reconnect(),
+        }
+    }
+
+    /// Bumped after every successful native MCP reconnect so callers holding a
+    /// prewarmed session can rotate it onto the fresh client.
+    pub fn native_mcp_generation(&self) -> u64 {
+        self.native_mcp_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Replaces a fail-closed native MCP client with a freshly connected one.
+    /// Safe to call while idle; single-flight and a no-op when healthy.
+    pub async fn reconnect_native_mcp(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.native_mcp_reconnecting.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let reconnected = self.reconnect_native_mcp_inner().await;
+        self.native_mcp_reconnecting.store(false, Ordering::SeqCst);
+        reconnected
+    }
+
+    async fn reconnect_native_mcp_inner(&self) -> bool {
+        if !self.native_mcp_needs_reconnect() {
+            return false;
+        }
+        match self.native_mcp_client() {
+            Some(current) => {
+                warn!("native Home Assistant MCP client is fail-closed; reconnecting");
+                for name in current.tool_names() {
+                    if let Err(err) = self.tool_server.remove_tool(&name).await {
+                        warn!("failed to remove stale MCP tool {name}: {err}");
+                    }
+                }
+            }
+            None => warn!("native Home Assistant MCP was never connected; connecting at idle"),
+        }
+        let fresh = McpConnections::connect(self.config.clone(), self.tool_server.clone())
+            .await
+            .native_client();
+        match fresh {
+            Some(fresh) => {
+                match self.native_mcp.write() {
+                    Ok(mut slot) => *slot = Some(fresh),
+                    Err(poisoned) => *poisoned.into_inner() = Some(fresh),
+                }
+                self.native_mcp_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!("reconnected native Home Assistant MCP tools");
+                true
+            }
+            None => {
+                warn!("native MCP reconnect failed; keeping fail-closed client until retry");
+                false
+            }
+        }
     }
 
     async fn prompt_once(&self, prompt: String) -> anyhow::Result<String> {
@@ -175,7 +268,7 @@ impl AgentRuntime {
 
         let agent = client
             .agent(self.config.llm.model.as_str())
-            .preamble(SPEAKER_AGENT_INSTRUCTIONS)
+            .preamble(&speaker_instructions(&self.config))
             .temperature(self.config.llm.temperature)
             .max_tokens(self.config.llm.max_tokens)
             .default_max_turns(3)

@@ -86,11 +86,17 @@ pub struct QwenRealtimeConfig {
     pub output_audio_format: AudioFormat,
     pub input_sample_rate: SampleRate,
     pub output_sample_rate: SampleRate,
+    pub turn_detection_threshold: f64,
+    pub turn_detection_silence_duration_ms: u32,
     pub connect_timeout_s: f64,
     pub event_timeout_s: f64,
     pub tool_timeout_s: f64,
     pub max_tool_calls: usize,
     pub max_tool_iterations: usize,
+    /// Composed speaker instructions injected at startup (built-in rules plus
+    /// `agent.custom_instructions`). Never read from YAML.
+    #[serde(skip)]
+    pub speaker_instructions: Option<String>,
 }
 
 impl Default for QwenRealtimeConfig {
@@ -105,11 +111,17 @@ impl Default for QwenRealtimeConfig {
             output_audio_format: AudioFormat::Pcm,
             input_sample_rate: SampleRate(16_000),
             output_sample_rate: SampleRate(48_000),
+            turn_detection_threshold: 0.5,
+            // Qwen's documented default is 800 ms. The speaker uses 500 ms to
+            // reduce turn-end latency while staying well above the 200 ms
+            // minimum that tends to split natural pauses.
+            turn_detection_silence_duration_ms: 500,
             connect_timeout_s: 10.0,
             event_timeout_s: 30.0,
             tool_timeout_s: 10.0,
             max_tool_calls: 8,
             max_tool_iterations: 4,
+            speaker_instructions: None,
         }
     }
 }
@@ -134,6 +146,14 @@ impl QwenRealtimeConfig {
             return Err(RealtimeVoiceConfigError::InvalidOutputSampleRate(
                 self.output_sample_rate.0,
             ));
+        }
+        if !self.turn_detection_threshold.is_finite()
+            || !(-1.0..=1.0).contains(&self.turn_detection_threshold)
+        {
+            return Err(RealtimeVoiceConfigError::InvalidTurnDetectionThreshold);
+        }
+        if !(200..=6_000).contains(&self.turn_detection_silence_duration_ms) {
+            return Err(RealtimeVoiceConfigError::InvalidTurnDetectionSilence);
         }
         if !self.connect_timeout_s.is_finite() || self.connect_timeout_s <= 0.0 {
             return Err(RealtimeVoiceConfigError::InvalidConnectTimeout);
@@ -169,6 +189,10 @@ pub enum RealtimeVoiceConfigError {
     InvalidInputSampleRate(u32),
     #[error("voice.qwen.output_sample_rate must be 48000 for WebRTC Opus, got {0}")]
     InvalidOutputSampleRate(u32),
+    #[error("voice.qwen.turn_detection_threshold must be finite and between -1 and 1")]
+    InvalidTurnDetectionThreshold,
+    #[error("voice.qwen.turn_detection_silence_duration_ms must be between 200 and 6000")]
+    InvalidTurnDetectionSilence,
     #[error("voice.qwen.connect_timeout_s must be finite and greater than zero")]
     InvalidConnectTimeout,
     #[error("voice.qwen.event_timeout_s must be finite and greater than zero")]
@@ -457,6 +481,9 @@ pub struct AgentConfig {
     pub timezone: String,
     pub weather: WeatherConfig,
     pub web_search: WebSearchConfig,
+    /// Site-specific rules appended to the built-in speaker instructions,
+    /// editable from the web UI. Keep short; every token ships with each session.
+    pub custom_instructions: String,
 }
 
 impl Default for AgentConfig {
@@ -465,6 +492,7 @@ impl Default for AgentConfig {
             timezone: "Asia/Shanghai".to_string(),
             weather: WeatherConfig::default(),
             web_search: WebSearchConfig::default(),
+            custom_instructions: String::new(),
         }
     }
 }
@@ -782,6 +810,8 @@ mod tests {
         assert_eq!(config.qwen.voice, "Tina");
         assert_eq!(config.qwen.input_sample_rate.0, 16_000);
         assert_eq!(config.qwen.output_sample_rate.0, 48_000);
+        assert_eq!(config.qwen.turn_detection_threshold, 0.5);
+        assert_eq!(config.qwen.turn_detection_silence_duration_ms, 500);
         assert_eq!(config.validate(), Ok(()));
     }
 
@@ -812,6 +842,22 @@ mod tests {
             config.validate(),
             Err(RealtimeVoiceConfigError::InvalidInputSampleRate(24_000))
         );
+    }
+
+    #[test]
+    fn validates_qwen_turn_detection_bounds() {
+        for yaml in [
+            "qwen:\n  turn_detection_threshold: 1.1\n",
+            "qwen:\n  turn_detection_threshold: .nan\n",
+            "qwen:\n  turn_detection_silence_duration_ms: 199\n",
+            "qwen:\n  turn_detection_silence_duration_ms: 6001\n",
+        ] {
+            let invalid: RealtimeVoiceConfig = serde_yaml::from_str(yaml).unwrap();
+            assert!(
+                invalid.validate().is_err(),
+                "accepted invalid config: {yaml}"
+            );
+        }
     }
 
     #[test]

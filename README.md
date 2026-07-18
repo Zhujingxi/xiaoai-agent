@@ -106,8 +106,15 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
   `{WorkspaceId}` 替换为 API Key 所属地域的百炼业务空间 ID
 - `voice.qwen`：原生 Qwen Realtime 的 WebRTC 信令地址、模型、音色和音频参数。
   VPM 输入固定为 16 kHz 单声道 S16_LE，传输层编码为 Opus/RTP；模型返回的
-  Opus/RTP 音频解码为 48 kHz 单声道 S16_LE 播放。会话使用 `semantic_vad`，
-  控制事件和工具调用通过服务端 `txt` DataChannel 传输；
+  Opus/RTP 音频解码为 48 kHz 单声道 S16_LE 播放。程序启动时预加载工具定义并
+  预热 WebRTC 会话，唤醒后才打开真实麦克风流，避免把 ICE/SDP 建连时间暴露在
+  首轮对话中。会话使用 `semantic_vad`；`turn_detection_threshold` 控制语音
+  检测灵敏度，`turn_detection_silence_duration_ms` 默认为低延迟的 500 ms，
+  可在 200–6000 ms 的官方范围内调节。
+  本地播放使用约 200 ms 的有界队列和低延迟 ALSA 缓冲；收到
+  `input_audio_buffer.speech_started` 时立即停止接收旧响应 RTP、清空应用队列并
+  重启 `aplay` 以清除 ALSA 中已提交的旧音频，直到下一次 `response.created`
+  才恢复播放。控制事件和工具调用通过服务端 `txt` DataChannel 传输；
   `tool_timeout_s`、`max_tool_calls` 和 `max_tool_iterations` 为每轮工具执行设置
   超时与上限，防止模型无限递归调用
 - `mcp.home_assistant`：Home Assistant MCP 配置；`timeout_s` 除了限制旧版 SSE

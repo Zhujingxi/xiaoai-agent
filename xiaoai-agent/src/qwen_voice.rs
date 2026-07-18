@@ -24,9 +24,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 #[cfg(test)]
-use tokio::time::{sleep_until, Instant};
+use tokio::time::sleep_until;
+use tokio::time::{timeout, Instant};
 #[cfg(test)]
 use tokio_tungstenite::connect_async;
 #[cfg(test)]
@@ -45,7 +45,9 @@ use url::Url;
 use crate::agent::SPEAKER_AGENT_INSTRUCTIONS;
 #[cfg(test)]
 use crate::audio::record::AudioRecorder;
+#[cfg(test)]
 use crate::capture::record_utterance_streaming;
+use crate::capture::stream_audio_continuously;
 use crate::config::{timeout_duration, CaptureConfig, QwenRealtimeConfig};
 use crate::mcp::{NativeMcpCallError, NativeMcpClient};
 #[cfg(test)]
@@ -61,7 +63,9 @@ mod webrtc_session;
 #[cfg(test)]
 #[allow(dead_code)]
 const UPLOAD_QUEUE_CAPACITY: usize = 32;
-const PLAYBACK_QUEUE_CAPACITY: usize = 64;
+// Qwen's official low-latency WebRTC example bounds local playback to 200 ms.
+// The decoder feeds 5 ms blocks, so forty entries preserve that upper bound.
+const PLAYBACK_QUEUE_CAPACITY: usize = 40;
 const PLAYER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const PLAYER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -128,7 +132,7 @@ impl SessionMachine {
                 | (Connecting, Ready | Reconnecting | Failed | ShuttingDown)
                 | (
                     Ready,
-                    Capturing | Cancelling | ShuttingDown | Reconnecting | Failed
+                    Capturing | Responding | Cancelling | ShuttingDown | Reconnecting | Failed
                 )
                 | (
                     Capturing,
@@ -167,6 +171,8 @@ pub enum QueueError {
     Full,
     #[error("queue is closed")]
     Closed,
+    #[error("audio belongs to an interrupted response")]
+    Suppressed,
 }
 
 #[cfg(test)]
@@ -207,6 +213,9 @@ enum PlaybackControl {
 pub struct PcmPlayerHandle {
     audio_tx: mpsc::Sender<Vec<u8>>,
     control_tx: watch::Sender<PlaybackControl>,
+    clear_tx: watch::Sender<u64>,
+    accepting_audio: Arc<AtomicBool>,
+    response_started_at: Arc<StdMutex<Option<Instant>>>,
     spawn_gate: Arc<StdMutex<PlaybackControl>>,
 }
 
@@ -215,8 +224,22 @@ impl PcmPlayerHandle {
         if *self.control_tx.borrow() != PlaybackControl::Running {
             return Err(QueueError::Closed);
         }
+        if !self.accepting_audio.load(Ordering::SeqCst) {
+            return Err(QueueError::Suppressed);
+        }
         match self.audio_tx.try_send(bytes) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Ok(mut started_at) = self.response_started_at.lock() {
+                    if let Some(started_at) = started_at.take() {
+                        tracing::info!(
+                            target: "xiaoai_agent::qwen_latency",
+                            response_to_first_audio_ms = started_at.elapsed().as_millis() as u64,
+                            "QWEN_LATENCY first_output_audio"
+                        );
+                    }
+                }
+                Ok(())
+            }
             Err(mpsc::error::TrySendError::Full(_)) => Err(QueueError::Full),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(QueueError::Closed),
         }
@@ -229,6 +252,26 @@ impl PcmPlayerHandle {
         };
         *state = PlaybackControl::Shutdown;
         let _ = self.control_tx.send(PlaybackControl::Shutdown);
+    }
+
+    fn interrupt_playback(&self) {
+        if *self.control_tx.borrow() == PlaybackControl::Running {
+            self.accepting_audio.store(false, Ordering::SeqCst);
+            if let Ok(mut started_at) = self.response_started_at.lock() {
+                started_at.take();
+            }
+            self.clear_tx
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+    }
+
+    fn begin_response(&self) {
+        if *self.control_tx.borrow() == PlaybackControl::Running {
+            if let Ok(mut started_at) = self.response_started_at.lock() {
+                *started_at = Some(Instant::now());
+            }
+            self.accepting_audio.store(true, Ordering::SeqCst);
+        }
     }
 
     fn finish(&self) {
@@ -260,6 +303,7 @@ struct PlayerSetup {
     device: String,
     sample_rate: u32,
     setup_phase: Option<Arc<StdMutex<SetupPhase>>>,
+    restart_on_clear: bool,
 }
 
 impl PcmPlayer {
@@ -269,7 +313,14 @@ impl PcmPlayer {
         sample_rate: u32,
         setup_phase: Arc<StdMutex<SetupPhase>>,
     ) -> Self {
-        Self::spawn_with_setup_gate(path, device, sample_rate, Some(setup_phase), spawn_aplay)
+        Self::spawn_with_setup_gate(
+            path,
+            device,
+            sample_rate,
+            Some(setup_phase),
+            true,
+            spawn_aplay,
+        )
     }
 
     #[cfg(test)]
@@ -277,7 +328,7 @@ impl PcmPlayer {
     where
         F: FnOnce(&str, &str, u32) -> anyhow::Result<(Child, ChildStdin)> + Send + 'static,
     {
-        Self::spawn_with_setup_gate(path, device, sample_rate, None, spawn)
+        Self::spawn_with_setup_gate(path, device, sample_rate, None, false, spawn)
     }
 
     fn spawn_with_setup_gate<F>(
@@ -285,6 +336,7 @@ impl PcmPlayer {
         device: String,
         sample_rate: u32,
         setup_phase: Option<Arc<StdMutex<SetupPhase>>>,
+        restart_on_clear: bool,
         spawn: F,
     ) -> Self
     where
@@ -292,6 +344,9 @@ impl PcmPlayer {
     {
         let (audio_tx, audio_rx) = mpsc::channel(PLAYBACK_QUEUE_CAPACITY);
         let (control_tx, control_rx) = watch::channel(PlaybackControl::Running);
+        let (clear_tx, clear_rx) = watch::channel(0u64);
+        let accepting_audio = Arc::new(AtomicBool::new(false));
+        let response_started_at = Arc::new(StdMutex::new(None));
         let spawn_gate = Arc::new(StdMutex::new(PlaybackControl::Running));
         let task = tokio::spawn(run_player(
             PlayerSetup {
@@ -299,9 +354,11 @@ impl PcmPlayer {
                 device,
                 sample_rate,
                 setup_phase,
+                restart_on_clear,
             },
             audio_rx,
             control_rx,
+            clear_rx,
             spawn_gate.clone(),
             spawn,
         ));
@@ -309,6 +366,9 @@ impl PcmPlayer {
             handle: PcmPlayerHandle {
                 audio_tx,
                 control_tx,
+                clear_tx,
+                accepting_audio,
+                response_started_at,
                 spawn_gate,
             },
             task: Some(task),
@@ -427,6 +487,8 @@ fn aplay_args(device: &str, sample_rate: u32) -> Vec<String> {
         sample_rate.to_string(),
         "-c".to_string(),
         "1".to_string(),
+        "--period-time=10000".to_string(),
+        "--buffer-time=40000".to_string(),
     ]
 }
 
@@ -479,23 +541,41 @@ async fn run_player<F>(
     setup: PlayerSetup,
     mut audio_rx: mpsc::Receiver<Vec<u8>>,
     mut control_rx: watch::Receiver<PlaybackControl>,
+    mut clear_rx: watch::Receiver<u64>,
     spawn_gate: Arc<StdMutex<PlaybackControl>>,
     spawn: F,
 ) -> anyhow::Result<()>
 where
     F: FnOnce(&str, &str, u32) -> anyhow::Result<(Child, ChildStdin)>,
 {
-    let Some((mut child, mut stdin)) =
-        construct_player_if_running(&spawn_gate, setup.setup_phase.as_deref(), || {
-            spawn(&setup.path, &setup.device, setup.sample_rate)
-        })?
-    else {
-        return Ok(());
-    };
+    enum WriteOutcome {
+        Completed,
+        Cleared,
+        Drain,
+    }
+
+    let mut initial_spawn = Some(spawn);
+    let mut process = None::<(Child, ChildStdin)>;
     let mut drain = false;
     'player: loop {
         tokio::select! {
             biased;
+            changed = clear_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                discard_pending_pcm(&mut audio_rx);
+                if setup.restart_on_clear {
+                    // Bytes already written to aplay may be buffered inside
+                    // ALSA and cannot be recalled through stdin. Restarting
+                    // the short-lived player is the only reliable hardware
+                    // flush available on the OH2P firmware.
+                    if let Some((mut child, stdin)) = process.take() {
+                        drop(stdin);
+                        stop_child(&mut child).await;
+                    }
+                }
+            }
             changed = control_rx.changed() => {
                 if changed.is_err() || *control_rx.borrow() == PlaybackControl::Shutdown {
                     break;
@@ -507,17 +587,63 @@ where
             }
             audio = audio_rx.recv() => {
                 let Some(bytes) = audio else { break; };
-                tokio::select! {
-                    biased;
-                    changed = control_rx.changed() => {
-                        if changed.is_err() || *control_rx.borrow() == PlaybackControl::Shutdown {
-                            break 'player;
+                if process.is_none() {
+                    let spawned = if let Some(spawn) = initial_spawn.take() {
+                        construct_player_if_running(
+                            &spawn_gate,
+                            setup.setup_phase.as_deref(),
+                            || spawn(&setup.path, &setup.device, setup.sample_rate),
+                        )?
+                    } else if setup.restart_on_clear {
+                        construct_player_if_running(
+                            &spawn_gate,
+                            setup.setup_phase.as_deref(),
+                            || spawn_aplay(&setup.path, &setup.device, setup.sample_rate),
+                        )?
+                    } else {
+                        None
+                    };
+                    let Some(spawned) = spawned else { break; };
+                    process = Some(spawned);
+                }
+                let write_outcome = {
+                    let stdin = &mut process.as_mut().expect("player process was created").1;
+                    tokio::select! {
+                        biased;
+                        changed = clear_rx.changed() => {
+                            if changed.is_err() {
+                                break 'player;
+                            }
+                            WriteOutcome::Cleared
+                        }
+                        changed = control_rx.changed() => {
+                            if changed.is_err() || *control_rx.borrow() == PlaybackControl::Shutdown {
+                                break 'player;
+                            }
+                            WriteOutcome::Drain
+                        }
+                        result = timeout(PLAYER_WRITE_TIMEOUT, stdin.write_all(&bytes)) => {
+                            result
+                                .context("realtime player write timed out")?
+                                .context("write realtime PCM")?;
+                            WriteOutcome::Completed
                         }
                     }
-                    result = timeout(PLAYER_WRITE_TIMEOUT, stdin.write_all(&bytes)) => {
-                        result
-                            .context("realtime player write timed out")?
-                            .context("write realtime PCM")?;
+                };
+                match write_outcome {
+                    WriteOutcome::Completed => {}
+                    WriteOutcome::Drain => {
+                        drain = true;
+                        break;
+                    }
+                    WriteOutcome::Cleared => {
+                        discard_pending_pcm(&mut audio_rx);
+                        if setup.restart_on_clear {
+                            if let Some((mut child, stdin)) = process.take() {
+                                drop(stdin);
+                                stop_child(&mut child).await;
+                            }
+                        }
                     }
                 }
             }
@@ -526,19 +652,33 @@ where
     if drain {
         audio_rx.close();
         while let Some(bytes) = audio_rx.recv().await {
-            timeout(PLAYER_WRITE_TIMEOUT, stdin.write_all(&bytes))
-                .await
-                .context("realtime player drain write timed out")?
-                .context("drain realtime PCM")?;
+            if let Some((_, stdin)) = &mut process {
+                timeout(PLAYER_WRITE_TIMEOUT, stdin.write_all(&bytes))
+                    .await
+                    .context("realtime player drain write timed out")?
+                    .context("drain realtime PCM")?;
+            }
         }
     }
-    drop(stdin);
-    if drain {
-        drain_child(&mut child).await
+    if let Some((mut child, stdin)) = process {
+        drop(stdin);
+        if drain {
+            drain_child(&mut child).await
+        } else {
+            stop_child(&mut child).await;
+            Ok(())
+        }
     } else {
-        stop_child(&mut child).await;
         Ok(())
     }
+}
+
+fn discard_pending_pcm(audio_rx: &mut mpsc::Receiver<Vec<u8>>) -> usize {
+    let mut discarded = 0;
+    while audio_rx.try_recv().is_ok() {
+        discarded += 1;
+    }
+    discarded
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,6 +710,8 @@ impl SessionTerminalOutcome {
 #[derive(Clone)]
 pub struct SessionHandle {
     cancel_tx: watch::Sender<bool>,
+    interrupt_tx: watch::Sender<u64>,
+    activation_tx: watch::Sender<bool>,
     terminal_rx: watch::Receiver<Option<SessionTerminalOutcome>>,
     setup_phase: Arc<StdMutex<SetupPhase>>,
 }
@@ -580,6 +722,13 @@ struct PreparedSessionControl {
     cancel_rx: watch::Receiver<bool>,
     terminal_tx: watch::Sender<Option<SessionTerminalOutcome>>,
     terminal_rx: watch::Receiver<Option<SessionTerminalOutcome>>,
+    setup_phase: Arc<StdMutex<SetupPhase>>,
+}
+
+struct RealtimeSessionControl {
+    cancel_rx: watch::Receiver<bool>,
+    interrupt_rx: watch::Receiver<u64>,
+    activation_rx: watch::Receiver<bool>,
     setup_phase: Arc<StdMutex<SetupPhase>>,
 }
 
@@ -597,12 +746,9 @@ impl QwenSessionTurn {
     pub async fn run(self) -> anyhow::Result<()> {
         let config = self.service.config.clone();
         let capture = self.service.capture.clone();
-        let tools = NativeToolRuntime::load_with_native_mcp(
-            &config,
-            self.service.tool_server.clone(),
-            self.service.native_mcp.clone(),
-        )
-        .await?;
+        let interrupt_rx = self.control.handle.interrupt_tx.subscribe();
+        let activation_rx = self.control.handle.activation_tx.subscribe();
+        let tools = self.service.native_tool_runtime().await?;
         self.service
             .run_prepared_supervised_session(
                 self.control,
@@ -612,8 +758,12 @@ impl QwenSessionTurn {
                         capture,
                         tools,
                         self.idle_timeout,
-                        cancel_rx,
-                        setup_phase,
+                        RealtimeSessionControl {
+                            cancel_rx,
+                            interrupt_rx,
+                            activation_rx,
+                            setup_phase,
+                        },
                     )
                 },
                 SESSION_CANCEL_TIMEOUT,
@@ -632,6 +782,15 @@ impl SessionHandle {
 
     fn is_completed(&self) -> bool {
         self.terminal_rx.borrow().is_some()
+    }
+
+    pub fn interrupt(&self) {
+        self.interrupt_tx
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    pub fn activate(&self) {
+        let _ = self.activation_tx.send(true);
     }
 
     pub async fn cancel(&self) -> SessionTerminalOutcome {
@@ -706,12 +865,27 @@ impl Drop for SessionWaiterGuard {
     }
 }
 
+/// Resolved at the start of every session so a reconnected MCP client is
+/// picked up without restarting the process. The generation changes whenever
+/// the MCP connection (and therefore the registered tool set) may have
+/// changed, invalidating the cached Qwen tool definitions.
+pub struct NativeMcpSnapshot {
+    pub generation: u64,
+    pub client: Option<NativeMcpClient>,
+}
+
+pub type NativeMcpProvider = Arc<dyn Fn() -> NativeMcpSnapshot + Send + Sync>;
+
+// Qwen tool definitions cached per MCP generation.
+type ToolDefinitionCache = Arc<Mutex<Option<(u64, Vec<ToolDefinition>)>>>;
+
 #[derive(Clone)]
 pub struct QwenVoiceService {
     config: QwenRealtimeConfig,
     capture: CaptureConfig,
     tool_server: ToolServerHandle,
-    native_mcp: Option<NativeMcpClient>,
+    native_mcp: NativeMcpProvider,
+    tool_definitions: ToolDefinitionCache,
     active: Arc<Mutex<Option<ActiveSession>>>,
     next_session_id: Arc<AtomicU64>,
 }
@@ -726,15 +900,47 @@ impl QwenVoiceService {
             config,
             capture,
             tool_server,
-            native_mcp: None,
+            native_mcp: Arc::new(|| NativeMcpSnapshot {
+                generation: 0,
+                client: None,
+            }),
+            tool_definitions: Arc::new(Mutex::new(None)),
             active: Arc::new(Mutex::new(None)),
             next_session_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    pub fn with_native_mcp(mut self, native_mcp: Option<NativeMcpClient>) -> Self {
-        self.native_mcp = native_mcp;
+    pub fn with_native_mcp_provider(mut self, provider: NativeMcpProvider) -> Self {
+        self.native_mcp = provider;
         self
+    }
+
+    pub async fn preload_tools(&self) -> anyhow::Result<()> {
+        let generation = (self.native_mcp)().generation;
+        self.cached_tool_definitions(generation).await.map(|_| ())
+    }
+
+    async fn cached_tool_definitions(&self, generation: u64) -> anyhow::Result<Vec<ToolDefinition>> {
+        let mut cache = self.tool_definitions.lock().await;
+        if let Some((cached_generation, definitions)) = cache.as_ref() {
+            if *cached_generation == generation {
+                return Ok(definitions.clone());
+            }
+        }
+        let definitions = load_tool_definitions(self.tool_server.clone()).await?;
+        *cache = Some((generation, definitions.clone()));
+        Ok(definitions)
+    }
+
+    async fn native_tool_runtime(&self) -> anyhow::Result<NativeToolRuntime> {
+        let snapshot = (self.native_mcp)();
+        let definitions = self.cached_tool_definitions(snapshot.generation).await?;
+        Ok(NativeToolRuntime::from_definitions(
+            &self.config,
+            self.tool_server.clone(),
+            snapshot.client,
+            definitions,
+        ))
     }
 
     #[cfg(test)]
@@ -759,10 +965,14 @@ impl QwenVoiceService {
     fn prepare_session_control(&self) -> PreparedSessionControl {
         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (interrupt_tx, _interrupt_rx) = watch::channel(0u64);
+        let (activation_tx, _activation_rx) = watch::channel(false);
         let (terminal_tx, terminal_rx) = watch::channel(None);
         let setup_phase = Arc::new(StdMutex::new(SetupPhase::Connecting));
         let handle = SessionHandle {
             cancel_tx,
+            interrupt_tx,
+            activation_tx,
             terminal_rx: terminal_rx.clone(),
             setup_phase: setup_phase.clone(),
         };
@@ -1016,45 +1226,64 @@ fn normalize_qwen_tool_schema(schema: &mut Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn load_tool_definitions(server: ToolServerHandle) -> anyhow::Result<Vec<ToolDefinition>> {
+    server
+        .get_tool_defs(None)
+        .await
+        .context("load native Qwen tool definitions")?
+        .into_iter()
+        .map(|definition| {
+            anyhow::ensure!(
+                definition.parameters.is_object(),
+                "tool {} parameters must be a JSON Schema object",
+                definition.name
+            );
+            let mut parameters = definition.parameters;
+            normalize_qwen_tool_schema(&mut parameters).with_context(|| {
+                format!(
+                    "normalize tool {} schema for Qwen realtime",
+                    definition.name
+                )
+            })?;
+            Ok(ToolDefinition::Function {
+                function: FunctionDefinition {
+                    name: definition.name,
+                    description: definition.description,
+                    parameters,
+                },
+            })
+        })
+        .collect()
+}
+
 impl NativeToolRuntime {
     #[cfg(test)]
     async fn load(config: &QwenRealtimeConfig, server: ToolServerHandle) -> anyhow::Result<Self> {
         Self::load_with_native_mcp(config, server, None).await
     }
 
+    #[cfg(test)]
     async fn load_with_native_mcp(
         config: &QwenRealtimeConfig,
         server: ToolServerHandle,
         native_mcp: Option<NativeMcpClient>,
     ) -> anyhow::Result<Self> {
-        let definitions = server
-            .get_tool_defs(None)
-            .await
-            .context("load native Qwen tool definitions")?
-            .into_iter()
-            .map(|definition| {
-                anyhow::ensure!(
-                    definition.parameters.is_object(),
-                    "tool {} parameters must be a JSON Schema object",
-                    definition.name
-                );
-                let mut parameters = definition.parameters;
-                normalize_qwen_tool_schema(&mut parameters).with_context(|| {
-                    format!(
-                        "normalize tool {} schema for Qwen realtime",
-                        definition.name
-                    )
-                })?;
-                Ok(ToolDefinition::Function {
-                    function: FunctionDefinition {
-                        name: definition.name,
-                        description: definition.description,
-                        parameters,
-                    },
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self {
+        let definitions = load_tool_definitions(server.clone()).await?;
+        Ok(Self::from_definitions(
+            config,
+            server,
+            native_mcp,
+            definitions,
+        ))
+    }
+
+    fn from_definitions(
+        config: &QwenRealtimeConfig,
+        server: ToolServerHandle,
+        native_mcp: Option<NativeMcpClient>,
+        definitions: Vec<ToolDefinition>,
+    ) -> Self {
+        Self {
             server,
             native_mcp,
             definitions,
@@ -1063,7 +1292,7 @@ impl NativeToolRuntime {
             max_iterations: config.max_tool_iterations,
             effects_observed: Arc::new(AtomicBool::new(false)),
             generic_calls: Arc::new(GenericToolState::default()),
-        })
+        }
     }
 
     fn start_generic_call(
@@ -1131,6 +1360,7 @@ impl NativeToolRuntime {
         let call_timeout = self.call_timeout;
         let effects_observed = self.effects_observed.clone();
         let generic_calls = self.generic_calls.clone();
+        tracing::info!(tool = %name, arguments = %arguments, "native Qwen tool call");
         // Start generic work eagerly when the protocol has already supplied a valid object.
         // Otherwise a fully buffered websocket can repeatedly win the session select before
         // the boxed tool future gets its first poll, starving both execution and cancellation.
@@ -1397,18 +1627,9 @@ async fn run_realtime_session(
     capture: CaptureConfig,
     tools: NativeToolRuntime,
     idle_timeout: Duration,
-    mut cancel_rx: watch::Receiver<bool>,
-    setup_phase: Arc<StdMutex<SetupPhase>>,
+    mut control: RealtimeSessionControl,
 ) -> anyhow::Result<()> {
-    webrtc_session::run(
-        config,
-        capture,
-        tools,
-        idle_timeout,
-        &mut cancel_rx,
-        setup_phase,
-    )
-    .await
+    webrtc_session::run(config, capture, tools, idle_timeout, &mut control).await
 }
 
 #[cfg(test)]
@@ -1878,6 +2099,7 @@ where
                                 Ok(()) => {}
                                 Err(QueueError::Full) => anyhow::bail!("realtime playback queue full"),
                                 Err(QueueError::Closed) => anyhow::bail!("realtime playback task stopped"),
+                                Err(QueueError::Suppressed) => {}
                             }
                         }
                         ServerEvent::ResponseAudioTranscriptDone(done) => {
@@ -2901,6 +3123,8 @@ mod tests {
         (
             SessionHandle {
                 cancel_tx,
+                interrupt_tx: watch::channel(0).0,
+                activation_tx: watch::channel(false).0,
                 terminal_rx,
                 setup_phase: Arc::new(StdMutex::new(SetupPhase::Connecting)),
             },
@@ -4928,6 +5152,8 @@ mod tests {
         let (terminal_tx, terminal_rx) = watch::channel(None);
         let handle = SessionHandle {
             cancel_tx,
+            interrupt_tx: watch::channel(0).0,
+            activation_tx: watch::channel(false).0,
             terminal_rx,
             setup_phase: Arc::new(StdMutex::new(SetupPhase::Connecting)),
         };
@@ -5309,6 +5535,8 @@ mod tests {
         let (terminal_tx, terminal_rx) = watch::channel(None);
         let handle = SessionHandle {
             cancel_tx,
+            interrupt_tx: watch::channel(0).0,
+            activation_tx: watch::channel(false).0,
             terminal_rx,
             setup_phase: Arc::new(StdMutex::new(SetupPhase::Connecting)),
         };
@@ -5359,6 +5587,28 @@ mod tests {
             SessionState::Capturing,
             SessionState::Responding,
             SessionState::Cancelling,
+            SessionState::ShuttingDown,
+            SessionState::Closed,
+        ] {
+            machine.transition(state).unwrap();
+        }
+        assert_eq!(machine.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn state_machine_accepts_multiple_conversation_turns_and_barge_in() {
+        let mut machine = SessionMachine::new();
+        for state in [
+            SessionState::Connecting,
+            SessionState::Ready,
+            SessionState::Capturing,
+            SessionState::Responding,
+            SessionState::Ready,
+            SessionState::Capturing,
+            SessionState::Responding,
+            SessionState::Capturing,
+            SessionState::Responding,
+            SessionState::Ready,
             SessionState::ShuttingDown,
             SessionState::Closed,
         ] {
@@ -5423,6 +5673,9 @@ mod tests {
             24_000,
             spawn_aplay,
         );
+        let handle = player.handle();
+        handle.begin_response();
+        handle.try_audio(vec![0, 0]).unwrap();
         tokio::task::yield_now().await;
         assert!(player.shutdown().await.is_err());
     }
@@ -5458,6 +5711,7 @@ mod tests {
                 "default".to_string(),
                 24_000,
                 Some(handle.setup_phase.clone()),
+                false,
                 move |_path, _device, _sample_rate| {
                     observed_attempts.fetch_add(1, Ordering::SeqCst);
                     anyhow::bail!("process construction must not run after session cancellation")
@@ -5503,6 +5757,8 @@ mod tests {
                 Ok((child, stdin))
             },
         );
+        first.handle().begin_response();
+        first.handle().try_audio(vec![0, 0]).unwrap();
         spawned_rx.await.unwrap();
 
         let second_live = live_processes.clone();
@@ -5547,6 +5803,8 @@ mod tests {
         let (terminal_tx, terminal_rx) = watch::channel(None);
         let handle = SessionHandle {
             cancel_tx,
+            interrupt_tx: watch::channel(0).0,
+            activation_tx: watch::channel(false).0,
             terminal_rx,
             setup_phase: Arc::new(StdMutex::new(SetupPhase::Connecting)),
         };
@@ -5560,6 +5818,30 @@ mod tests {
             .send(Some(SessionTerminalOutcome::Clean))
             .unwrap();
         assert_eq!(waiter.await.unwrap(), SessionTerminalOutcome::Clean);
+    }
+
+    #[tokio::test]
+    async fn session_interrupt_notifies_without_cancelling() {
+        let (handle, mut cancel_rx) = session_handle(false);
+        let mut interrupt_rx = handle.interrupt_tx.subscribe();
+
+        handle.interrupt();
+
+        interrupt_rx.changed().await.unwrap();
+        assert_eq!(*interrupt_rx.borrow(), 1);
+        assert!(!*cancel_rx.borrow_and_update());
+    }
+
+    #[tokio::test]
+    async fn prewarmed_session_activation_is_distinct_from_cancel() {
+        let (handle, mut cancel_rx) = session_handle(false);
+        let mut activation_rx = handle.activation_tx.subscribe();
+
+        handle.activate();
+
+        activation_rx.changed().await.unwrap();
+        assert!(*activation_rx.borrow_and_update());
+        assert!(!*cancel_rx.borrow_and_update());
     }
 
     #[test]
@@ -5584,8 +5866,52 @@ mod tests {
     fn aplay_uses_exact_native_qwen_pcm_contract() {
         assert_eq!(
             aplay_args("default", 48_000),
-            ["-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "1"]
+            [
+                "-q",
+                "-D",
+                "default",
+                "-t",
+                "raw",
+                "-f",
+                "S16_LE",
+                "-r",
+                "48000",
+                "-c",
+                "1",
+                "--period-time=10000",
+                "--buffer-time=40000"
+            ]
         );
+    }
+
+    #[test]
+    fn playback_interrupt_discards_queued_pcm() {
+        let (tx, mut rx) = mpsc::channel(3);
+        tx.try_send(vec![1]).unwrap();
+        tx.try_send(vec![2]).unwrap();
+        assert_eq!(discard_pending_pcm(&mut rx), 2);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn playback_gate_drops_late_rtp_until_next_response() {
+        let (audio_tx, mut audio_rx) = mpsc::channel(2);
+        let (control_tx, _control_rx) = watch::channel(PlaybackControl::Running);
+        let handle = PcmPlayerHandle {
+            audio_tx,
+            control_tx,
+            clear_tx: watch::channel(0).0,
+            accepting_audio: Arc::new(AtomicBool::new(false)),
+            response_started_at: Arc::new(StdMutex::new(None)),
+            spawn_gate: Arc::new(StdMutex::new(PlaybackControl::Running)),
+        };
+
+        assert_eq!(handle.try_audio(vec![1]), Err(QueueError::Suppressed));
+        handle.begin_response();
+        handle.try_audio(vec![2]).unwrap();
+        assert_eq!(audio_rx.try_recv().unwrap(), vec![2]);
+        handle.interrupt_playback();
+        assert_eq!(handle.try_audio(vec![3]), Err(QueueError::Suppressed));
     }
 
     #[tokio::test]
@@ -5599,6 +5925,8 @@ mod tests {
             let (_terminal_tx, terminal_rx) = watch::channel(Some(outcome.clone()));
             let handle = SessionHandle {
                 cancel_tx,
+                interrupt_tx: watch::channel(0).0,
+                activation_tx: watch::channel(false).0,
                 terminal_rx,
                 setup_phase: Arc::new(StdMutex::new(SetupPhase::Connecting)),
             };

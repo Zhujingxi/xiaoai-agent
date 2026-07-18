@@ -182,6 +182,8 @@ pub struct QwenFields<S> {
     pub api_key: S,
     pub model: String,
     pub voice: String,
+    pub turn_detection_threshold: f64,
+    pub turn_detection_silence_duration_ms: u32,
     pub connect_timeout_s: f64,
     pub event_timeout_s: f64,
     pub tool_timeout_s: f64,
@@ -239,6 +241,7 @@ pub struct AgentFields<S> {
     pub timezone: String,
     pub weather: WeatherFields<S>,
     pub web_search: WebSearchFields<S>,
+    pub custom_instructions: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +345,11 @@ impl EditableConfig<SecretStatus> {
                     api_key: redact_secret(&app.voice.qwen.api_key),
                     model: app.voice.qwen.model.clone(),
                     voice: app.voice.qwen.voice.clone(),
+                    turn_detection_threshold: app.voice.qwen.turn_detection_threshold,
+                    turn_detection_silence_duration_ms: app
+                        .voice
+                        .qwen
+                        .turn_detection_silence_duration_ms,
                     connect_timeout_s: app.voice.qwen.connect_timeout_s,
                     event_timeout_s: app.voice.qwen.event_timeout_s,
                     tool_timeout_s: app.voice.qwen.tool_timeout_s,
@@ -400,6 +408,7 @@ impl EditableConfig<SecretStatus> {
                     max_results: app.agent.web_search.max_results,
                     search_depth: app.agent.web_search.search_depth.clone(),
                 },
+                custom_instructions: app.agent.custom_instructions.clone(),
             },
             home_assistant: HomeAssistantFields {
                 enabled: app.mcp.home_assistant.enabled,
@@ -457,6 +466,11 @@ impl EditableConfig<SecretStatus> {
                     api_key: keep(),
                     model: self.voice.qwen.model,
                     voice: self.voice.qwen.voice,
+                    turn_detection_threshold: self.voice.qwen.turn_detection_threshold,
+                    turn_detection_silence_duration_ms: self
+                        .voice
+                        .qwen
+                        .turn_detection_silence_duration_ms,
                     connect_timeout_s: self.voice.qwen.connect_timeout_s,
                     event_timeout_s: self.voice.qwen.event_timeout_s,
                     tool_timeout_s: self.voice.qwen.tool_timeout_s,
@@ -510,6 +524,7 @@ impl EditableConfig<SecretStatus> {
                     max_results: self.agent.web_search.max_results,
                     search_depth: self.agent.web_search.search_depth,
                 },
+                custom_instructions: self.agent.custom_instructions,
             },
             home_assistant: HomeAssistantFields {
                 enabled: self.home_assistant.enabled,
@@ -801,6 +816,20 @@ fn validate_update(update: &EditableConfig<SecretUpdate>) -> Result<(), ConfigSt
         "runtime.session_idle_timeout_s",
         update.runtime.session_idle_timeout_s,
     )?;
+    if !update.voice.qwen.turn_detection_threshold.is_finite()
+        || !(-1.0..=1.0).contains(&update.voice.qwen.turn_detection_threshold)
+    {
+        return Err(invalid_field(
+            "voice.qwen.turn_detection_threshold",
+            "must be between -1 and 1",
+        ));
+    }
+    if !(200..=6_000).contains(&update.voice.qwen.turn_detection_silence_duration_ms) {
+        return Err(invalid_field(
+            "voice.qwen.turn_detection_silence_duration_ms",
+            "must be between 200 and 6000",
+        ));
+    }
 
     for (field, value) in [
         (
@@ -879,6 +908,10 @@ fn validate_update(update: &EditableConfig<SecretUpdate>) -> Result<(), ConfigSt
         ("llm.base_url", update.llm.base_url.as_str()),
         ("llm.model", update.llm.model.as_str()),
         ("agent.timezone", update.agent.timezone.as_str()),
+        (
+            "agent.custom_instructions",
+            update.agent.custom_instructions.as_str(),
+        ),
         (
             "agent.weather.default_location",
             update.agent.weather.default_location.as_str(),
@@ -1044,6 +1077,14 @@ pub fn apply_update_to_yaml(
     set!(&["voice", "qwen", "model"], &update.voice.qwen.model);
     set!(&["voice", "qwen", "voice"], &update.voice.qwen.voice);
     set!(
+        &["voice", "qwen", "turn_detection_threshold"],
+        update.voice.qwen.turn_detection_threshold
+    );
+    set!(
+        &["voice", "qwen", "turn_detection_silence_duration_ms"],
+        update.voice.qwen.turn_detection_silence_duration_ms
+    );
+    set!(
         &["voice", "qwen", "connect_timeout_s"],
         update.voice.qwen.connect_timeout_s
     );
@@ -1129,6 +1170,10 @@ pub fn apply_update_to_yaml(
     apply_secret(root, &["llm", "api_key"], &update.llm.api_key)?;
 
     set!(&["agent", "timezone"], &update.agent.timezone);
+    set!(
+        &["agent", "custom_instructions"],
+        &update.agent.custom_instructions
+    );
     apply_secret(
         root,
         &["agent", "weather", "qweather_url"],

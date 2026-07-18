@@ -137,9 +137,9 @@ impl NativeMcpRouting {
     }
 
     fn routes_tool(&self, name: &str) -> bool {
-        if self.failed.load(Ordering::SeqCst) {
-            return true;
-        }
+        // A failed routing table still answers by membership: registered MCP
+        // tools stay on the native path so callers get the typed fail-closed
+        // error, while unrelated tools keep working through the generic path.
         match self.tools.read() {
             Ok(tools) => tools.contains(name),
             Err(_) => {
@@ -421,6 +421,21 @@ impl NativeMcpClient {
 
     pub fn is_poisoned(&self) -> bool {
         self.state.poisoned.load(Ordering::SeqCst)
+    }
+
+    /// A poisoned or fail-closed client can never serve another call in this
+    /// process; the owner should build a replacement connection.
+    pub fn needs_reconnect(&self) -> bool {
+        self.is_poisoned() || self.state.routing.failed.load(Ordering::SeqCst)
+    }
+
+    /// Names of the MCP tools this client routed, used to unregister stale
+    /// tool-server proxies before a replacement client re-registers them.
+    pub fn tool_names(&self) -> Vec<String> {
+        match self.state.routing.tools.read() {
+            Ok(tools) => tools.iter().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub async fn call(
@@ -955,6 +970,22 @@ mod tests {
         let lookup = poisoned_routing();
         assert!(lookup.routes_tool("must_stay_on_native_path"));
         assert!(lookup.failed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_routing_only_captures_registered_mcp_tools() {
+        let routing = Arc::new(super::NativeMcpRouting::default());
+        routing
+            .initialize_tools(["ha_turn_on".to_string()])
+            .expect("initialize routing tools");
+        routing.fail_closed();
+
+        // The registered MCP tool must stay on the native path so callers get
+        // the typed fail-closed error instead of a generic proxy retry.
+        assert!(routing.routes_tool("ha_turn_on"));
+        // Unrelated tools (weather, music, end_conversation, ...) must keep
+        // working through the generic path after an MCP failure.
+        assert!(!routing.routes_tool("get_weather"));
     }
 
     #[tokio::test]

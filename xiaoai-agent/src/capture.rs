@@ -175,6 +175,91 @@ where
     result
 }
 
+/// Keep the configured capture backend open and forward PCM until the task is
+/// cancelled or the backend fails. Realtime transports use their server-side
+/// VAD to split this continuous stream into conversational turns.
+pub async fn stream_audio_continuously<C, Fut>(
+    config: CaptureConfig,
+    on_audio_chunk: C,
+) -> anyhow::Result<()>
+where
+    C: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    if is_vpm_asr_capture(&config.pcm) {
+        let rx = subscribe_vpm_asr_audio()
+            .context("VPM ASR audio stream is unavailable; native KWS monitor is not ready")?;
+        let _asr_guard = VpmAsrGuard::start();
+        info!("CAPTURE_BACKEND backend=vpm_asr continuous=true");
+        return forward_vpm_audio(rx, on_audio_chunk).await;
+    }
+
+    let audio_config = AudioConfig {
+        pcm: config.pcm,
+        channels: config.channels,
+        bits_per_sample: config.bits_per_sample,
+        sample_rate: config.sample_rate,
+        period_size: config.period_size,
+        buffer_size: config.buffer_size,
+    };
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+    AudioRecorder::instance()
+        .start_recording(
+            move |bytes| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(bytes).await.map_err(|err| err.to_string())?;
+                    Ok(())
+                }
+            },
+            Some(audio_config),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    info!("CAPTURE_BACKEND backend=alsa continuous=true");
+    let result = async {
+        while let Some(bytes) = rx.recv().await {
+            on_audio_chunk(bytes).await?;
+        }
+        anyhow::bail!("audio recorder stopped during continuous capture")
+    }
+    .await;
+    let _ = AudioRecorder::instance().stop_recording().await;
+    result
+}
+
+async fn forward_vpm_audio<C, Fut>(
+    mut rx: broadcast::Receiver<Vec<u8>>,
+    on_audio_chunk: C,
+) -> anyhow::Result<()>
+where
+    C: Fn(Vec<u8>) -> Fut + Send + Sync,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+{
+    let mut chunks = 0u64;
+    loop {
+        let bytes = match rx.recv().await {
+            Ok(bytes) => bytes,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "lagged while continuously reading VPM ASR audio stream"
+                );
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                anyhow::bail!("VPM ASR audio stream stopped during continuous capture")
+            }
+        };
+        chunks += 1;
+        if chunks == 1 {
+            debug!(bytes = bytes.len(), "VPM_ASR_FIRST_CONTINUOUS_CHUNK");
+        }
+        on_audio_chunk(bytes).await?;
+    }
+}
+
 async fn record_vpm_asr_utterance<F, Fut>(
     config: CaptureConfig,
     idle_timeout: Duration,
@@ -397,6 +482,7 @@ fn is_vpm_asr_capture(pcm: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -438,5 +524,31 @@ mod tests {
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(LAST_STATUS.load(Ordering::SeqCst), VPM_STATUS_ASR_END);
         assert_eq!(END_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn continuous_vpm_stream_forwards_multiple_chunks() {
+        let (audio_tx, audio_rx) = broadcast::channel(4);
+        let received = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let observed = received.clone();
+        let task = tokio::spawn(async move {
+            forward_vpm_audio(audio_rx, move |bytes| {
+                let observed = observed.clone();
+                async move {
+                    observed.lock().unwrap().push(bytes.clone());
+                    if bytes == [2] {
+                        anyhow::bail!("test stream complete");
+                    }
+                    Ok(())
+                }
+            })
+            .await
+        });
+
+        audio_tx.send(vec![1]).unwrap();
+        audio_tx.send(vec![2]).unwrap();
+
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(*received.lock().unwrap(), [vec![1], vec![2]]);
     }
 }

@@ -28,7 +28,7 @@ use clap::Parser;
 use rand::seq::SliceRandom;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{interval, Instant, MissedTickBehavior};
 use tracing::{error, info, warn};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
@@ -46,6 +46,19 @@ use crate::qwen_voice::{QwenVoiceService, SessionHandle};
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
 const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，请稍后重试";
+// Bounds how often a dead prewarmed native session may be replaced. Async
+// failures (connect timeout, ICE, server-side idle timeout) already take
+// seconds to surface; this only guards against synchronous spawn errors.
+const WARM_RESPAWN_MIN_INTERVAL: Duration = Duration::from_secs(5);
+// Rotate the prewarmed native session well before Qwen's ~300 s idle timeout.
+// A session that is allowed to idle out reconnects inside run(), and such
+// reconnected sessions die at ICE level within ~48 s; freshly spawned
+// sessions stay healthy for the full 300 s.
+const WARM_SESSION_MAX_AGE: Duration = Duration::from_secs(240);
+// A fail-closed native MCP client is reconnected while the speaker is idle.
+// This bounds how often a reconnect attempt may run when Home Assistant
+// stays unreachable.
+const MCP_RECONNECT_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(name = "xiaoai-agent")]
@@ -64,12 +77,33 @@ struct Cli {
 struct ActiveTurn {
     task: JoinHandle<()>,
     native_session: Option<SessionHandle>,
+    activated: Arc<AtomicBool>,
     preserve_active_status: Arc<AtomicBool>,
 }
 
 impl ActiveTurn {
     fn is_finished(&self) -> bool {
         self.task.is_finished()
+    }
+
+    fn interrupt_native(&self) -> bool {
+        if self.task.is_finished() || !self.activated.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some(session) = &self.native_session else {
+            return false;
+        };
+        session.interrupt();
+        true
+    }
+
+    fn activate_native(&self) -> bool {
+        let Some(session) = &self.native_session else {
+            return false;
+        };
+        self.activated.store(true, Ordering::SeqCst);
+        session.activate();
+        true
     }
 
     async fn cancel_for_replacement(mut self) {
@@ -93,6 +127,47 @@ impl ActiveTurn {
     }
 }
 
+fn spawn_native_session(
+    qwen: QwenVoiceService,
+    idle_timeout: Duration,
+    device: Device,
+    device_config: crate::config::DeviceConfig,
+    status: Arc<crate::web::status::RuntimeStatus>,
+) -> anyhow::Result<ActiveTurn> {
+    let session = qwen.prepare_session(idle_timeout)?;
+    let native_session = session.handle();
+    let activated = Arc::new(AtomicBool::new(false));
+    let task_activated = activated.clone();
+    let preserve_active_status = Arc::new(AtomicBool::new(false));
+    let task_preserve_active_status = preserve_active_status.clone();
+    Ok(ActiveTurn {
+        task: tokio::spawn(async move {
+            let result = session.run().await;
+            cleanup_turn_leds(&device, &device_config).await;
+            match result {
+                Ok(()) => {
+                    if task_activated.load(Ordering::SeqCst)
+                        && !task_preserve_active_status.load(Ordering::SeqCst)
+                    {
+                        status.clear_last_error();
+                    }
+                }
+                Err(error) => {
+                    status.set_last_error(error.to_string());
+                    error!(target: "xiaoai_agent::web_status", "native Qwen voice session failed");
+                    error!("native Qwen voice session failed: {error:?}");
+                }
+            }
+            if task_activated.load(Ordering::SeqCst) {
+                info!(target: "xiaoai_agent::web_status", "voice turn finished");
+            }
+        }),
+        native_session: Some(native_session),
+        activated,
+        preserve_active_status,
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let log_buffer = crate::web::status::LogBuffer::new(200, 2048);
@@ -105,10 +180,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = Arc::new(
-        AppConfig::load(&cli.config)
-            .with_context(|| format!("failed to load config {}", cli.config.display()))?,
-    );
+    let mut app_config = AppConfig::load(&cli.config)
+        .with_context(|| format!("failed to load config {}", cli.config.display()))?;
+    app_config.voice.qwen.speaker_instructions =
+        Some(crate::agent::speaker_instructions(&app_config));
+    let config = Arc::new(app_config);
 
     let device = Device::new(config.device.clone());
     let asr = AsrClient::new(config.asr.clone())?;
@@ -120,8 +196,19 @@ async fn main() -> anyhow::Result<()> {
         config.voice.qwen.clone(),
         config.capture.clone(),
         agent.tool_server(),
-        agent.native_mcp_client(),
+        {
+            let agent = agent.clone();
+            Arc::new(move || crate::qwen_voice::NativeMcpSnapshot {
+                generation: agent.native_mcp_generation(),
+                client: agent.native_mcp_client(),
+            })
+        },
     );
+    if let Some(qwen) = &qwen_voice {
+        qwen.preload_tools()
+            .await
+            .context("preload native Qwen tool definitions")?;
+    }
 
     let (kws_tx, mut kws_rx) = mpsc::channel::<KwsMonitorEvent>(16);
     let restart_required = Arc::new(AtomicBool::new(false));
@@ -165,8 +252,29 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     let mut active_turn: Option<ActiveTurn> = None;
+    let native_idle_timeout =
+        Duration::from_secs_f64(config.runtime.session_idle_timeout_s.max(1.0));
+    let mut warm_spawned_at: Option<Instant> = None;
+    let mut warm_native_turn = qwen_voice
+        .clone()
+        .map(|qwen| {
+            spawn_native_session(
+                qwen,
+                native_idle_timeout,
+                device.clone(),
+                config.device.clone(),
+                status.clone(),
+            )
+        })
+        .transpose()?;
+    if warm_native_turn.is_some() {
+        warm_spawned_at = Some(Instant::now());
+    }
     let mut turn_check = interval(Duration::from_millis(250));
     turn_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut last_warm_respawn: Option<Instant> = None;
+    let mut last_mcp_reconnect: Option<Instant> = None;
+    let mut last_mcp_generation = agent.native_mcp_generation();
 
     loop {
         tokio::select! {
@@ -179,6 +287,13 @@ async fn main() -> anyhow::Result<()> {
                     }
                     KwsMonitorEvent::Keyword(keyword) => {
                         info!("WAKE keyword={keyword}");
+                        if active_turn
+                            .as_ref()
+                            .is_some_and(ActiveTurn::interrupt_native)
+                        {
+                            info!("wake keyword interrupted the active Qwen conversation");
+                            continue;
+                        }
                         if let Some(turn) = active_turn.take() {
                             turn.cancel_for_replacement().await;
                         }
@@ -192,51 +307,58 @@ async fn main() -> anyhow::Result<()> {
                         agent.reset_session("wake keyword").await;
 
                         if let Some(qwen) = qwen_voice.clone() {
-                            let device = device.clone();
-                            let device_config = config.device.clone();
-                            let idle_timeout = Duration::from_secs_f64(
-                                config.runtime.session_idle_timeout_s.max(1.0),
-                            );
-                            let session = match qwen.prepare_session(idle_timeout) {
-                                Ok(session) => session,
-                                Err(error) => {
-                                    status.set_active_turn(false);
-                                    status.set_last_error(error.to_string());
-                                    error!(target: "xiaoai_agent::web_status", "native Qwen voice session failed");
-                                    error!("failed to prepare native Qwen voice session: {error:?}");
-                                    continue;
+                            warm_spawned_at = None;
+                            let turn = match warm_native_turn.take() {
+                                Some(turn) if !turn.is_finished() => turn,
+                                Some(turn) => {
+                                    turn.join().await;
+                                    match spawn_native_session(
+                                        qwen,
+                                        native_idle_timeout,
+                                        device.clone(),
+                                        config.device.clone(),
+                                        status.clone(),
+                                    ) {
+                                        Ok(turn) => turn,
+                                        Err(error) => {
+                                            status.set_active_turn(false);
+                                            status.set_last_error(error.to_string());
+                                            error!("failed to prepare native Qwen voice session: {error:?}");
+                                            continue;
+                                        }
+                                    }
                                 }
+                                None => match spawn_native_session(
+                                    qwen,
+                                    native_idle_timeout,
+                                    device.clone(),
+                                    config.device.clone(),
+                                    status.clone(),
+                                ) {
+                                    Ok(turn) => turn,
+                                    Err(error) => {
+                                        status.set_active_turn(false);
+                                        status.set_last_error(error.to_string());
+                                        error!("failed to prepare native Qwen voice session: {error:?}");
+                                        continue;
+                                    }
+                                },
                             };
-                            let native_session = session.handle();
-                            let turn_status = status.clone();
-                            let preserve_active_status = Arc::new(AtomicBool::new(false));
-                            let task_preserve_active_status = preserve_active_status.clone();
+                            turn.activate_native();
+                            device.show_led(config.device.led_listening).await;
+                            if let Some(text) =
+                                choose_acknowledge_text(&config.runtime.acknowledge_text)
+                            {
+                                let ack_device = device.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = ack_device.speak(&text).await {
+                                        warn!("failed to speak acknowledge text: {err:?}");
+                                    }
+                                });
+                            }
                             info!(target: "xiaoai_agent::web_status", "voice turn started");
                             status.set_active_turn(true);
-                            active_turn = Some(ActiveTurn {
-                                task: tokio::spawn(async move {
-                                    let result = session.run().await;
-                                    cleanup_turn_leds(&device, &device_config).await;
-                                    match result {
-                                        Ok(()) => {
-                                            if !task_preserve_active_status.load(Ordering::SeqCst) {
-                                                turn_status.clear_last_error();
-                                            }
-                                        }
-                                        Err(error) => {
-                                            turn_status.set_last_error(error.to_string());
-                                            error!(target: "xiaoai_agent::web_status", "native Qwen voice session failed");
-                                            error!("native Qwen voice session failed: {error:?}");
-                                        }
-                                    }
-                                    if !task_preserve_active_status.load(Ordering::SeqCst) {
-                                        turn_status.set_active_turn(false);
-                                    }
-                                    info!(target: "xiaoai_agent::web_status", "voice turn finished");
-                                }),
-                                native_session: Some(native_session),
-                                preserve_active_status,
-                            });
+                            active_turn = Some(turn);
                         } else {
                             let state = TurnState {
                                 config: config.clone(),
@@ -271,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
                                     info!(target: "xiaoai_agent::web_status", "voice turn finished");
                                 }),
                                 native_session: None,
+                                activated: Arc::new(AtomicBool::new(true)),
                                 preserve_active_status,
                             });
                         }
@@ -284,12 +407,102 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or(false);
                 if turn_finished {
                     if let Some(handle) = active_turn.take() {
+                        let was_native = handle.native_session.is_some();
                         handle.join().await;
+                        if was_native {
+                            if let Some(qwen) = qwen_voice.clone() {
+                                warm_native_turn = spawn_native_session(
+                                    qwen,
+                                    native_idle_timeout,
+                                    device.clone(),
+                                    config.device.clone(),
+                                    status.clone(),
+                                ).ok();
+                                if warm_native_turn.is_some() {
+                                    warm_spawned_at = Some(Instant::now());
+                                }
+                            }
+                        }
                     }
                     status.set_active_turn(false);
                     device
                         .blink_ready(config.device.led_listening, Duration::from_millis(250))
                         .await;
+                }
+                // A fail-closed native MCP client (poisoned by a timeout or a
+                // cancelled in-flight call) is replaced while idle so smart
+                // home tools recover without a manual restart.
+                if active_turn.is_none()
+                    && agent.native_mcp_needs_reconnect()
+                    && last_mcp_reconnect
+                        .is_none_or(|at| at.elapsed() >= MCP_RECONNECT_MIN_INTERVAL)
+                {
+                    last_mcp_reconnect = Some(Instant::now());
+                    let agent = agent.clone();
+                    tokio::spawn(async move {
+                        agent.reconnect_native_mcp().await;
+                    });
+                }
+                let mcp_generation = agent.native_mcp_generation();
+                if mcp_generation != last_mcp_generation {
+                    last_mcp_generation = mcp_generation;
+                    // The prewarmed session resolved the old MCP client when it
+                    // was spawned; rotate it so the next wake uses the fresh one.
+                    if let Some(turn) = warm_native_turn.take() {
+                        warm_spawned_at = None;
+                        info!("rotating warm native Qwen session after MCP reconnect");
+                        turn.cancel_for_replacement().await;
+                    }
+                }
+                // Retire the warm session before Qwen's ~300 s idle timeout can
+                // kill it (see WARM_SESSION_MAX_AGE).
+                let warm_too_old = warm_native_turn.is_some()
+                    && warm_spawned_at.is_some_and(|at| at.elapsed() >= WARM_SESSION_MAX_AGE);
+                if warm_too_old {
+                    if let Some(turn) = warm_native_turn.take() {
+                        warm_spawned_at = None;
+                        info!("rotating warm native Qwen session before server idle timeout");
+                        turn.cancel_for_replacement().await;
+                    }
+                }
+                let warm_finished = warm_native_turn
+                    .as_ref()
+                    .is_some_and(ActiveTurn::is_finished);
+                if warm_finished {
+                    warm_spawned_at = None;
+                    if let Some(turn) = warm_native_turn.take() {
+                        turn.join().await;
+                    }
+                }
+                // Qwen closes idle prewarmed sessions after ~300 s and the
+                // reconnect budget inside a session is bounded, so a warm
+                // session eventually dies for good. Replace it promptly or
+                // the next wake pays the cold-start latency or hits ICE
+                // failures with no session ready.
+                if warm_native_turn.is_none() && active_turn.is_none() {
+                    if let Some(qwen) = qwen_voice.clone() {
+                        if last_warm_respawn
+                            .is_none_or(|at| at.elapsed() >= WARM_RESPAWN_MIN_INTERVAL)
+                        {
+                            last_warm_respawn = Some(Instant::now());
+                            match spawn_native_session(
+                                qwen,
+                                native_idle_timeout,
+                                device.clone(),
+                                config.device.clone(),
+                                status.clone(),
+                            ) {
+                                Ok(turn) => {
+                                    info!("respawned warm native Qwen session");
+                                    warm_spawned_at = Some(Instant::now());
+                                    warm_native_turn = Some(turn);
+                                }
+                                Err(error) => {
+                                    warn!("failed to respawn warm native Qwen session: {error:?}");
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -513,10 +726,11 @@ fn build_qwen_voice_service(
     config: QwenRealtimeConfig,
     capture: CaptureConfig,
     tool_server: rig_core::tool::server::ToolServerHandle,
-    native_mcp: Option<crate::mcp::NativeMcpClient>,
+    native_mcp: crate::qwen_voice::NativeMcpProvider,
 ) -> Option<QwenVoiceService> {
-    uses_native_qwen(runtime)
-        .then(|| QwenVoiceService::new(config, capture, tool_server).with_native_mcp(native_mcp))
+    uses_native_qwen(runtime).then(|| {
+        QwenVoiceService::new(config, capture, tool_server).with_native_mcp_provider(native_mcp)
+    })
 }
 
 #[cfg(test)]
@@ -557,12 +771,22 @@ mod tests {
             config.clone(),
             capture.clone(),
             tools.clone(),
-            None,
+            Arc::new(|| crate::qwen_voice::NativeMcpSnapshot {
+                generation: 0,
+                client: None,
+            }),
         )
         .is_none());
-        assert!(
-            build_qwen_voice_service(VoiceRuntime::NativeQwen, config, capture, tools, None)
-                .is_some()
-        );
+        assert!(build_qwen_voice_service(
+            VoiceRuntime::NativeQwen,
+            config,
+            capture,
+            tools,
+            Arc::new(|| crate::qwen_voice::NativeMcpSnapshot {
+                generation: 0,
+                client: None,
+            })
+        )
+        .is_some());
     }
 }

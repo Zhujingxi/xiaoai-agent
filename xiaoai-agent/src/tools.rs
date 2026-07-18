@@ -311,8 +311,10 @@ pub struct EndArgs {
     reason: String,
 }
 
+pub const END_CONVERSATION_TOOL_NAME: &str = "end_conversation";
+
 impl Tool for EndConversation {
-    const NAME: &'static str = "end_conversation";
+    const NAME: &'static str = END_CONVERSATION_TOOL_NAME;
     type Error = ToolCallError;
     type Args = EndArgs;
     type Output = String;

@@ -140,7 +140,10 @@ pub struct FunctionCallOutput(pub String);
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerEvent {
     SessionUpdated(SessionUpdatedEvent),
+    ResponseCreated(ResponseCreatedEvent),
     ResponseDone(ResponseDoneEvent),
+    InputAudioSpeechStarted(InputAudioSpeechStartedEvent),
+    InputAudioSpeechStopped(InputAudioSpeechStoppedEvent),
     ResponseAudioDelta(ResponseAudioDeltaEvent),
     ResponseAudioDone(ResponseAudioDoneEvent),
     ResponseAudioTranscriptDelta(ResponseAudioTranscriptDeltaEvent),
@@ -171,7 +174,14 @@ impl<'de> Deserialize<'de> for ServerEvent {
 
         match event_type {
             "session.updated" => decode!(SessionUpdated, SessionUpdatedEvent),
+            "response.created" => decode!(ResponseCreated, ResponseCreatedEvent),
             "response.done" => decode!(ResponseDone, ResponseDoneEvent),
+            "input_audio_buffer.speech_started" => {
+                decode!(InputAudioSpeechStarted, InputAudioSpeechStartedEvent)
+            }
+            "input_audio_buffer.speech_stopped" => {
+                decode!(InputAudioSpeechStopped, InputAudioSpeechStoppedEvent)
+            }
             "response.audio.delta" => decode!(ResponseAudioDelta, ResponseAudioDeltaEvent),
             "response.audio.done" => decode!(ResponseAudioDone, ResponseAudioDoneEvent),
             "response.audio_transcript.delta" => decode!(
@@ -223,6 +233,34 @@ pub struct ResponseDoneEvent {
     #[serde(default)]
     pub event_id: Option<EventId>,
     pub response: RealtimeResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ResponseCreatedEvent {
+    #[serde(default)]
+    pub event_id: Option<EventId>,
+    pub response: CreatedResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CreatedResponse {
+    pub id: ResponseId,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct InputAudioSpeechStartedEvent {
+    #[serde(default)]
+    pub event_id: Option<EventId>,
+    pub audio_start_ms: u64,
+    pub item_id: ItemId,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct InputAudioSpeechStoppedEvent {
+    #[serde(default)]
+    pub event_id: Option<EventId>,
+    pub audio_end_ms: u64,
+    pub item_id: ItemId,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -486,6 +524,49 @@ mod tests {
         };
         assert_eq!(delta.delta, Base64Pcm::new("AQID"));
         assert_eq!(delta.response_id, ResponseId::new("resp-1"));
+    }
+
+    #[test]
+    fn deserializes_typed_barge_in_lifecycle_events() {
+        let started: ServerEvent = serde_json::from_value(json!({
+            "type":"input_audio_buffer.speech_started",
+            "audio_start_ms":1200,
+            "item_id":"item-user"
+        }))
+        .unwrap();
+        let stopped: ServerEvent = serde_json::from_value(json!({
+            "type":"input_audio_buffer.speech_stopped",
+            "audio_end_ms":3400,
+            "item_id":"item-user"
+        }))
+        .unwrap();
+        let created: ServerEvent = serde_json::from_value(json!({
+            "type":"response.created",
+            "response":{"id":"resp-next"}
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            started,
+            ServerEvent::InputAudioSpeechStarted(InputAudioSpeechStartedEvent {
+                audio_start_ms: 1200,
+                ..
+            })
+        ));
+        assert!(matches!(
+            stopped,
+            ServerEvent::InputAudioSpeechStopped(InputAudioSpeechStoppedEvent {
+                audio_end_ms: 3400,
+                ..
+            })
+        ));
+        assert!(matches!(
+            created,
+            ServerEvent::ResponseCreated(ResponseCreatedEvent {
+                response: CreatedResponse { id },
+                ..
+            }) if id == ResponseId::new("resp-next")
+        ));
     }
 
     #[test]

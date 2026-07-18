@@ -64,6 +64,10 @@ voice:
     input_sample_rate: 16000
     # WebRTC negotiates Opus at a 48 kHz RTP clock. Playback is decoded to 48 kHz PCM.
     output_sample_rate: 48000
+    # Qwen3.5 Omni recommends semantic VAD. Lower silence reduces turn-end latency;
+    # 500 ms is the low-latency default, while 800 ms is Qwen's conservative default.
+    turn_detection_threshold: 0.5
+    turn_detection_silence_duration_ms: 500
     connect_timeout_s: 10
     event_timeout_s: 30
     # Native tool calls are cancellable, individually timed out, and bounded per turn.
@@ -123,6 +127,9 @@ llm:
 
 agent:
   timezone: Asia/Shanghai
+  # Site-specific rules appended to the built-in speaker instructions (also
+  # editable in the web UI). Keep short; the text ships with every session.
+  custom_instructions: ""
   weather:
     qweather_url: ""
     default_location: ""
