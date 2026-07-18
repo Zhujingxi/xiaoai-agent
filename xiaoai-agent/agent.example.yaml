@@ -25,6 +25,9 @@ device:
   duck_audio_command: "amixer sget mysoftvol | awk -F'[][]' '/%/ {print $2; exit}' | tr -d '%' >/tmp/xiaoai-mysoftvol.before; amixer sset mysoftvol 25% >/dev/null 2>&1 || true"
   unduck_audio_command: "v=$(cat /tmp/xiaoai-mysoftvol.before 2>/dev/null); if [ -n \"$v\" ]; then amixer sset mysoftvol \"${v}%\" >/dev/null 2>&1 || true; fi; rm -f /tmp/xiaoai-mysoftvol.before"
   abort_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause 2>/dev/null || true; ubus call mediaplayer media_control '{\"player\":\"mediaplayer\",\"action\":\"pause\",\"volume\":0}' 2>/dev/null || true; ubus call mediaplayer player_play_operation '{\"media\":\"app_ios\",\"action\":\"stop\"}' 2>/dev/null || true"
+  # Short progress tone played while a slow remote brain (voice.runtime: hermes)
+  # is still working. The agent writes the WAV to /tmp at startup.
+  thinking_sound_command: "aplay -q /tmp/xiaoai-thinking.wav"
   led_enabled: true
   led_listening: 3
   led_user_speaking: 4
@@ -51,6 +54,10 @@ voice:
   # legacy keeps the ASR -> text Agent -> device TTS pipeline below.
   # native_qwen sends VPM-processed microphone audio to Qwen Realtime over WebRTC
   # and lets it call the same built-in and MCP tools registered with the text Agent.
+  # hermes keeps the ASR -> device TTS pipeline but replaces the text Agent with a
+  # remote Hermes Agent (Nous Research) API server configured via llm.*; the remote
+  # agent is the sole brain, so no local tool definitions are sent and continuous
+  # sessions end via runtime.session_idle_timeout_s instead of end_conversation.
   runtime: legacy
   qwen:
     # Beijing endpoint. Replace {WorkspaceId}; for Singapore use
@@ -124,12 +131,27 @@ llm:
   max_tokens: 300
   retries: 1
   temperature: 0.5
+  # With voice.runtime: hermes, point these at a Hermes Agent (Nous Research)
+  # API server on the LAN: enable it with API_SERVER_ENABLED=true,
+  # API_SERVER_KEY=<secret>, API_SERVER_HOST=0.0.0.0 (it binds localhost by
+  # default) and keep `hermes gateway` running, then use:
+  # base_url: http://<macmini-ip>:8642/v1
+  # api_key: <API_SERVER_KEY>
+  # model: hermes-agent
+  # timeout_s: 60  # agent runs with tool use are slower than plain LLM calls
+  # retries: 0     # retrying an agent run can duplicate real-world side effects
 
 agent:
   timezone: Asia/Shanghai
   # Site-specific rules appended to the built-in speaker instructions (also
   # editable in the web UI). Keep short; the text ships with every session.
   custom_instructions: ""
+  # Progress tone while a hermes-mode reply is still being generated, so long
+  # tool loops do not leave dead air. Only used when voice.runtime is hermes.
+  thinking_sound:
+    enabled: true
+    delay_s: 5.0
+    interval_s: 6.0
   weather:
     qweather_url: ""
     default_location: ""

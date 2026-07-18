@@ -29,7 +29,7 @@ use rand::seq::SliceRandom;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
@@ -46,6 +46,9 @@ use crate::qwen_voice::{QwenVoiceService, SessionHandle};
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
 const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，请稍后重试";
+// Progress tone played while a slow remote brain (hermes runtime) is working.
+// Keep in sync with the device.thinking_sound_command default.
+const THINKING_SOUND_WAV_PATH: &str = "/tmp/xiaoai-thinking.wav";
 // Bounds how often a dead prewarmed native session may be replaced. Async
 // failures (connect timeout, ICE, server-side idle timeout) already take
 // seconds to surface; this only guards against synchronous spawn errors.
@@ -208,6 +211,11 @@ async fn main() -> anyhow::Result<()> {
         qwen.preload_tools()
             .await
             .context("preload native Qwen tool definitions")?;
+    }
+    if config.voice.runtime == VoiceRuntime::Hermes && config.agent.thinking_sound.enabled {
+        if let Err(err) = write_thinking_sound_wav(std::path::Path::new(THINKING_SOUND_WAV_PATH)) {
+            warn!("failed to prepare thinking sound WAV: {err:?}");
+        }
     }
 
     let (kws_tx, mut kws_rx) = mpsc::channel::<KwsMonitorEvent>(16);
@@ -661,7 +669,11 @@ async fn run_session(state: TurnState) -> anyhow::Result<()> {
         }
         info!("USER_ASR text={command}");
 
-        let reply = match state.agent.run_turn(command).await {
+        let reply = {
+            let _thinking_sound = ThinkingSoundGuard(start_thinking_sound(&state));
+            state.agent.run_turn(command).await
+        };
+        let reply = match reply {
             Ok(reply) => reply,
             Err(err) => {
                 speak_service_error(&state.device, led, LLM_SERVICE_ERROR_PROMPT).await;
@@ -699,6 +711,86 @@ async fn cleanup_turn_leds(device: &Device, led: &DeviceConfig) {
     ] {
         device.shut_led(id).await;
     }
+}
+
+/// Aborts the progress-sound ticker on every exit path (reply, error, or
+/// session end); dropping a bare JoinHandle would detach it instead.
+struct ThinkingSoundGuard(Option<JoinHandle<()>>);
+
+impl Drop for ThinkingSoundGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Periodic progress tone while a slow remote brain is still working, so long
+/// Hermes tool loops do not leave dead air. Only runs in hermes mode.
+fn start_thinking_sound(state: &TurnState) -> Option<JoinHandle<()>> {
+    let cfg = &state.config.agent.thinking_sound;
+    if state.config.voice.runtime != VoiceRuntime::Hermes || !cfg.enabled {
+        return None;
+    }
+    let delay = Duration::from_secs_f64(cfg.delay_s.max(1.0));
+    let interval = Duration::from_secs_f64(cfg.interval_s.max(1.0));
+    let device = state.device.clone();
+    Some(tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        loop {
+            if let Err(err) = device.play_thinking_sound().await {
+                debug!("thinking sound playback failed: {err:?}");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }))
+}
+
+/// Writes the short two-note progress tone used by the thinking sound.
+/// 16 kHz mono S16_LE with raised-cosine edges, matching the firmware path.
+fn write_thinking_sound_wav(path: &std::path::Path) -> anyhow::Result<()> {
+    const RATE: u32 = 16_000;
+    const AMPLITUDE: f32 = 0.22;
+    let mut pcm: Vec<i16> = Vec::new();
+    for (freq, ms) in [(660.0_f32, 150_u32), (880.0_f32, 200_u32)] {
+        let n = (RATE as u64 * ms as u64 / 1000) as usize;
+        let fade = RATE as usize / 1000 * 30; // 30 ms edges avoid clicks
+        for i in 0..n {
+            let t = i as f32 / RATE as f32;
+            let edge = if i < fade {
+                i as f32 / fade as f32
+            } else if i + fade > n {
+                (n - i) as f32 / fade as f32
+            } else {
+                1.0
+            };
+            let envelope = 0.5 - 0.5 * (std::f32::consts::PI * edge).cos();
+            pcm.push(
+                (AMPLITUDE * envelope * (2.0 * std::f32::consts::PI * freq * t).sin()
+                    * i16::MAX as f32) as i16,
+            );
+        }
+    }
+    let data_len = (pcm.len() * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2_u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16_u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for sample in pcm {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    std::fs::write(path, wav)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 fn is_capture_timeout(err: &anyhow::Error) -> bool {
@@ -778,6 +870,17 @@ mod tests {
         )
         .is_none());
         assert!(build_qwen_voice_service(
+            VoiceRuntime::Hermes,
+            config.clone(),
+            capture.clone(),
+            tools.clone(),
+            Arc::new(|| crate::qwen_voice::NativeMcpSnapshot {
+                generation: 0,
+                client: None,
+            }),
+        )
+        .is_none());
+        assert!(build_qwen_voice_service(
             VoiceRuntime::NativeQwen,
             config,
             capture,
@@ -788,5 +891,19 @@ mod tests {
             })
         )
         .is_some());
+    }
+
+    #[test]
+    fn thinking_sound_wav_has_valid_header_and_expected_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thinking.wav");
+        write_thinking_sound_wav(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        // 0.35 s of 16 kHz mono S16_LE audio.
+        let data_len = u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as usize;
+        assert_eq!(data_len, 16_000 * 2 * 350 / 1000);
+        assert_eq!(bytes.len(), 44 + data_len);
     }
 }

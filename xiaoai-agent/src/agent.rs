@@ -7,9 +7,9 @@ use rig_core::providers::openai;
 use rig_core::tool::server::{ToolServer, ToolServerHandle};
 use serde_json::json;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
-use crate::config::{timeout_duration, AppConfig};
+use crate::config::{timeout_duration, AppConfig, VoiceRuntime};
 use crate::device::Device;
 use crate::mcp::{McpConnections, NativeMcpClient};
 use crate::music::MusicService;
@@ -64,6 +64,89 @@ pub struct AgentTurnResult {
     pub text: String,
     pub should_end: bool,
     pub end_reason: String,
+}
+
+/// Strips content that must never reach TTS: model reasoning blocks
+/// (`<think>...</think>`), tool-call/progress indicator lines (emoji-led, as
+/// produced by Hermes Agent), and markdown code-fence markers. The remote
+/// agent may include any of these in its final message; the speaker should
+/// only read the user-facing answer.
+pub fn sanitize_speech_text(raw: &str) -> String {
+    let without_thinking = strip_think_blocks(raw);
+    let mut kept = Vec::new();
+    for line in without_thinking.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            continue;
+        }
+        if trimmed
+            .chars()
+            .next()
+            .is_some_and(is_progress_indicator_char)
+        {
+            continue;
+        }
+        kept.push(line);
+    }
+    let joined = kept.join("\n");
+    // Collapse the blank runs left behind by removed lines, then trim.
+    let mut out = String::with_capacity(joined.len());
+    let mut newlines = 0;
+    for ch in joined.chars() {
+        if ch == '\n' {
+            newlines += 1;
+            if newlines > 2 {
+                continue;
+            }
+        } else {
+            newlines = 0;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+/// Removes `<think>...</think>` and `<thinking>...</thinking>` blocks. An
+/// unclosed opening tag drops the rest of the message: a truncated reasoning
+/// block must not leak into TTS either.
+fn strip_think_blocks(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    loop {
+        let open_at = ["<think>", "<thinking>"]
+            .iter()
+            .filter_map(|tag| rest.find(tag))
+            .min();
+        let Some(start) = open_at else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let (open_len, close) = if rest[start..].starts_with("<thinking>") {
+            ("<thinking>".len(), "</thinking>")
+        } else {
+            ("<think>".len(), "</think>")
+        };
+        let body_start = start + open_len;
+        match rest[body_start..].find(close) {
+            Some(i) => rest = &rest[body_start + i + close.len()..],
+            None => break,
+        }
+    }
+    out
+}
+
+/// Emoji-led lines are tool/progress indicators (e.g. "💻 ls", "🔍
+/// searching..."), not speakable answer text.
+fn is_progress_indicator_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2190..=0x21FF // arrows
+            | 0x2600..=0x27BF // misc symbols & dingbats
+            | 0x2B00..=0x2BFF // misc symbols & arrows (⏳)
+            | 0x1F000..=0x1FAFF // pictographs (💻🔍✅)
+            | 0xFE00..=0xFE0F // variation selectors
+    )
 }
 
 #[derive(Default)]
@@ -159,10 +242,17 @@ impl AgentRuntime {
                 return Err(anyhow::anyhow!("LLM request failed without attempts"));
             }
         }
-        let Some(text) = text else {
+        let Some(mut text) = text else {
             return Err(last_error
                 .unwrap_or_else(|| anyhow::anyhow!("LLM request failed without attempts")));
         };
+        if self.config.voice.runtime == VoiceRuntime::Hermes {
+            let sanitized = sanitize_speech_text(&text);
+            if sanitized.len() != text.len() {
+                debug!("stripped non-speech content from hermes reply");
+            }
+            text = sanitized;
+        }
 
         let control = self.control.lock().await;
         self.push_history(message, &text).await;
@@ -186,7 +276,7 @@ impl AgentRuntime {
 
     pub fn native_mcp_needs_reconnect(&self) -> bool {
         if !self.config.mcp.home_assistant.enabled
-            || self.config.voice.runtime == crate::config::VoiceRuntime::Legacy
+            || self.config.voice.runtime != crate::config::VoiceRuntime::NativeQwen
         {
             return false;
         }
@@ -266,21 +356,30 @@ impl AgentRuntime {
             .context("failed to create OpenAI-compatible Rig client")?
             .completions_api();
 
-        let agent = client
+        let builder = client
             .agent(self.config.llm.model.as_str())
             .preamble(&speaker_instructions(&self.config))
             .temperature(self.config.llm.temperature)
             .max_tokens(self.config.llm.max_tokens)
-            .default_max_turns(3)
-            .additional_params(json!({
-                "reasoning_effort": "low",
-                "enable_thinking": false,
-                "chat_template_kwargs": {"enable_thinking": false}
-            }))
-            .tool_server_handle(self.tool_server.clone())
-            .build();
+            .default_max_turns(3);
 
-        Ok(agent.prompt(prompt).await?.trim().to_string())
+        let text = if self.config.voice.runtime == VoiceRuntime::Hermes {
+            // The remote Hermes agent is the sole brain: do not advertise the
+            // local tool server or send provider-specific reasoning params.
+            builder.build().prompt(prompt).await?
+        } else {
+            builder
+                .additional_params(json!({
+                    "reasoning_effort": "low",
+                    "enable_thinking": false,
+                    "chat_template_kwargs": {"enable_thinking": false}
+                }))
+                .tool_server_handle(self.tool_server.clone())
+                .build()
+                .prompt(prompt)
+                .await?
+        };
+        Ok(text.trim().to_string())
     }
 
     pub async fn reset_session(&self, reason: &str) {
@@ -311,5 +410,53 @@ impl AgentRuntime {
         let mut history = self.history.lock().await;
         history.push(("用户".to_string(), user.to_string()));
         history.push(("助手".to_string(), assistant.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_speech_text;
+
+    #[test]
+    fn sanitize_keeps_plain_answer_text() {
+        let raw = "现在下午三点。";
+        assert_eq!(sanitize_speech_text(raw), raw);
+    }
+
+    #[test]
+    fn sanitize_strips_closed_and_unclosed_think_blocks() {
+        assert_eq!(
+            sanitize_speech_text("<think>先在内部推理一下</think>答案是四十二。"),
+            "答案是四十二。"
+        );
+        assert_eq!(
+            sanitize_speech_text("<thinking>更长标签的推理</thinking>答案B"),
+            "答案B"
+        );
+        assert_eq!(sanitize_speech_text("前面保留。<think>没写完的推理"), "前面保留。");
+    }
+
+    #[test]
+    fn sanitize_strips_tool_progress_lines_but_keeps_answer() {
+        let raw = "💻 ls -la\n🔍 searching the web...\n✅ found 3 results\n\n答案是：今天晴天。";
+        assert_eq!(sanitize_speech_text(raw), "答案是：今天晴天。");
+    }
+
+    #[test]
+    fn sanitize_strips_code_fence_markers_but_keeps_content() {
+        let raw = "可以这样：\n```sh\nuptime\n```\n就这些。";
+        assert_eq!(sanitize_speech_text(raw), "可以这样：\nuptime\n就这些。");
+    }
+
+    #[test]
+    fn sanitize_returns_empty_when_only_progress_output() {
+        assert_eq!(sanitize_speech_text("🔍 searching...\n💻 cargo test"), "");
+        assert_eq!(sanitize_speech_text("<think>只有推理</think>"), "");
+    }
+
+    #[test]
+    fn sanitize_collapses_blank_runs_left_by_stripped_lines() {
+        let raw = "第一句。\n🔍 searching...\n💻 working...\n第二句。";
+        assert_eq!(sanitize_speech_text(raw), "第一句。\n第二句。");
     }
 }

@@ -338,6 +338,7 @@ impl EditableConfig<SecretStatus> {
                 runtime: match app.voice.runtime {
                     VoiceRuntime::Legacy => "legacy",
                     VoiceRuntime::NativeQwen => "native_qwen",
+                    VoiceRuntime::Hermes => "hermes",
                 }
                 .to_string(),
                 qwen: QwenFields {
@@ -794,10 +795,13 @@ fn invalid_field(field: &str, message: impl Into<String>) -> ConfigStoreError {
 }
 
 fn validate_update(update: &EditableConfig<SecretUpdate>) -> Result<(), ConfigStoreError> {
-    if !matches!(update.voice.runtime.as_str(), "legacy" | "native_qwen") {
+    if !matches!(
+        update.voice.runtime.as_str(),
+        "legacy" | "native_qwen" | "hermes"
+    ) {
         return Err(invalid_field(
             "voice.runtime",
-            "must be legacy or native_qwen",
+            "must be legacy, native_qwen, or hermes",
         ));
     }
     if !matches!(
@@ -1651,6 +1655,31 @@ mod tests {
             yaml_string(&current, &["device", "tts_command"]),
             yaml_string(&backup, &["device", "tts_command"]),
         );
+    }
+
+    #[tokio::test]
+    async fn hermes_voice_runtime_round_trips_through_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.yaml");
+        std::fs::copy(example_config_path(), &path).unwrap();
+        let store = ConfigStore::new(path.clone(), Default::default());
+        let mut update = store
+            .load()
+            .await
+            .unwrap()
+            .editable
+            .into_update_keep_secrets();
+        assert_eq!(update.voice.runtime, "legacy");
+        update.voice.runtime = "hermes".to_string();
+
+        let saved = store.save(update).await.unwrap();
+
+        assert_eq!(saved.editable.voice.runtime, "hermes");
+        let current: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(yaml_string(&current, &["voice", "runtime"]), "hermes");
+        let app = crate::config::AppConfig::load(&path).unwrap();
+        assert_eq!(app.voice.runtime, crate::config::VoiceRuntime::Hermes);
     }
 
     #[tokio::test]

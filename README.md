@@ -103,7 +103,9 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
 - `voice.runtime`：语音运行时。默认 `legacy` 保留现有的 ASR → 文本 Agent →
   设备 TTS 链路；`native_qwen` 改用 Qwen3.5 Omni Realtime 的双向音频链路，
   此时必须配置 `voice.qwen.api_key`，并把 `voice.qwen.url` 中的
-  `{WorkspaceId}` 替换为 API Key 所属地域的百炼业务空间 ID
+  `{WorkspaceId}` 替换为 API Key 所属地域的百炼业务空间 ID；`hermes` 保留
+  ASR → 设备 TTS 链路，但把文本 Agent 替换为局域网内的 Hermes Agent API
+  服务（见下文「接入 Hermes Agent」）
 - `voice.qwen`：原生 Qwen Realtime 的 WebRTC 信令地址、模型、音色和音频参数。
   VPM 输入固定为 16 kHz 单声道 S16_LE，传输层编码为 Opus/RTP；模型返回的
   Opus/RTP 音频解码为 48 kHz 单声道 S16_LE 播放。程序启动时预加载工具定义并
@@ -132,6 +134,35 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
 MCP，而会作为 `invalid_arguments` 结构化错误返回模型。未知工具、MCP 错误和超时也
 会作为结构化错误返回模型。工具执行和 WebRTC DataChannel 发送均响应会话取消。
 `legacy` 运行时不启用此原生循环，行为保持不变。
+
+#### 接入 Hermes Agent（Nous Research）
+
+可以把语音运行时切换到局域网内运行的 [Hermes Agent](https://github.com/NousResearch/hermes-agent)（例如一台 Mac mini）：音箱端继续负责唤醒、ASR 和设备 TTS，由 Hermes 接管对话、工具调用、记忆和技能。`legacy` 和 `native_qwen` 模式不受影响，可随时切回。
+
+1. 在 Mac mini 上启用 Hermes API 服务：在 `~/.hermes/.env` 中加入
+   `API_SERVER_ENABLED=true`、`API_SERVER_KEY=<随机密钥>`、
+   `API_SERVER_HOST=0.0.0.0`（默认只监听 localhost），保持 `hermes gateway`
+   常驻运行（可用 tmux 或 launchd），必要时在 macOS 防火墙放行 8642 端口。
+2. 在局域网另一台机器上验证：
+   `curl http://<macmini-ip>:8642/v1/models -H "Authorization: Bearer <密钥>"`
+   应返回 `hermes-agent` 模型。
+3. 在音箱的 Web 配置页（或直接编辑 `agent.yaml`）设置：
+   `voice.runtime: hermes`、`llm.base_url: http://<macmini-ip>:8642/v1`、
+   `llm.api_key: <密钥>`、`llm.model: hermes-agent`、`llm.timeout_s: 60`
+   （Agent 工具循环比普通 LLM 请求慢）、`llm.retries: 0`（重试会让 Agent
+   副作用重复执行）。保存并重启 Agent。
+4. 注意：此模式下端侧的音乐、天气、Home Assistant MCP 等本地工具定义不会随
+   请求发送；如需设备控制，请在 Hermes 侧配置对应工具（Hermes 原生支持 Home
+   Assistant，Navidrome 等也可以作为 MCP server 挂到 Hermes）。连续对话改由
+   `runtime.session_idle_timeout_s` 空闲超时结束。Hermes API 服务无 TLS，
+   请仅在可信局域网内使用；回答风格如需更口语化，可调整 Hermes 的
+   SOUL.md 或 `agent.custom_instructions`。
+5. 播报卫生：回复在 TTS 前会清理不可朗读内容——`<think>` 推理块、
+   Hermes 的工具/进度提示行（如 `💻 ls`、`🔍 searching...`）以及 Markdown
+   代码围栏都不会被念出来；清理后为空时本轮不播报。Hermes 工具循环较慢时，
+   端侧会按 `agent.thinking_sound`（默认等待 5 秒后每 6 秒一次）播放短促的
+   进度提示音代替静默，可用 `agent.thinking_sound.enabled: false` 关闭，
+   提示音命令见 `device.thinking_sound_command`。
 
 #### Web 配置页面
 

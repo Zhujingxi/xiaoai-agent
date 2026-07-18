@@ -29,6 +29,10 @@ impl Device {
             .await
     }
 
+    pub async fn play_thinking_sound(&self) -> anyhow::Result<()> {
+        self.run_script(&self.config.thinking_sound_command).await
+    }
+
     pub async fn stop_audio(&self) -> anyhow::Result<()> {
         self.run_script(&self.config.stop_audio_command).await
     }

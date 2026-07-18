@@ -721,7 +721,7 @@ impl McpConnections {
             ClientCapabilities::default(),
             Implementation::new("xiaoai-agent", env!("CARGO_PKG_VERSION")),
         );
-        if config.voice.runtime == VoiceRuntime::Legacy {
+        if config.voice.runtime != VoiceRuntime::NativeQwen {
             return Self::connect_legacy(client_info, tool_server, ha, timeout).await;
         }
         Self::connect_native(client_info, tool_server, ha, timeout).await

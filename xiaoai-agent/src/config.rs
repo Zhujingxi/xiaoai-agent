@@ -73,6 +73,9 @@ pub enum VoiceRuntime {
     #[default]
     Legacy,
     NativeQwen,
+    /// ASR -> remote Hermes Agent (Nous Research) -> device TTS. Uses the
+    /// legacy capture/TTS pipeline, but the remote agent is the sole brain.
+    Hermes,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -256,6 +259,7 @@ pub struct DeviceConfig {
     pub duck_audio_command: String,
     pub unduck_audio_command: String,
     pub abort_command: String,
+    pub thinking_sound_command: String,
     pub led_enabled: bool,
     pub led_listening: u8,
     pub led_user_speaking: u8,
@@ -285,6 +289,10 @@ impl Default for DeviceConfig {
                 "v=$(cat /tmp/xiaoai-mysoftvol.before 2>/dev/null); if [ -n \"$v\" ]; then amixer sset mysoftvol \"${v}%\" >/dev/null 2>&1 || true; fi; rm -f /tmp/xiaoai-mysoftvol.before"
                     .to_string(),
             abort_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause 2>/dev/null || true; ubus call mediaplayer media_control '{\"player\":\"mediaplayer\",\"action\":\"pause\",\"volume\":0}' 2>/dev/null || true; ubus call mediaplayer player_play_operation '{\"media\":\"app_ios\",\"action\":\"stop\"}' 2>/dev/null || true".to_string(),
+            // Plays a short progress tone while a slow remote brain (hermes
+            // runtime) is still working. The agent writes the WAV to /tmp at
+            // startup; keep the path in sync with THINKING_SOUND_WAV_PATH.
+            thinking_sound_command: "aplay -q /tmp/xiaoai-thinking.wav".to_string(),
             led_enabled: true,
             led_listening: 3,
             led_user_speaking: 4,
@@ -484,6 +492,7 @@ pub struct AgentConfig {
     /// Site-specific rules appended to the built-in speaker instructions,
     /// editable from the web UI. Keep short; every token ships with each session.
     pub custom_instructions: String,
+    pub thinking_sound: ThinkingSoundConfig,
 }
 
 impl Default for AgentConfig {
@@ -493,6 +502,27 @@ impl Default for AgentConfig {
             weather: WeatherConfig::default(),
             web_search: WebSearchConfig::default(),
             custom_instructions: String::new(),
+            thinking_sound: ThinkingSoundConfig::default(),
+        }
+    }
+}
+
+/// Periodic progress tone played while a slow remote brain (hermes runtime) is
+/// still working on a reply. Only used when `voice.runtime` is `hermes`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ThinkingSoundConfig {
+    pub enabled: bool,
+    pub delay_s: f64,
+    pub interval_s: f64,
+}
+
+impl Default for ThinkingSoundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            delay_s: 5.0,
+            interval_s: 6.0,
         }
     }
 }
@@ -801,6 +831,36 @@ mod tests {
     fn parses_openai_realtime_provider_alias() {
         let config: AsrConfig = serde_yaml::from_str("provider: openai_realtime\n").unwrap();
         assert!(matches!(config.provider, AsrProvider::OpenAiRealtime));
+    }
+
+    #[test]
+    fn voice_runtime_parses_hermes_and_defaults_to_legacy() {
+        let config: RealtimeVoiceConfig = serde_yaml::from_str("runtime: hermes\n").unwrap();
+        assert_eq!(config.runtime, VoiceRuntime::Hermes);
+        assert_eq!(config.validate(), Ok(()));
+        let config: RealtimeVoiceConfig = serde_yaml::from_str("{}\n").unwrap();
+        assert_eq!(config.runtime, VoiceRuntime::Legacy);
+    }
+
+    #[test]
+    fn thinking_sound_defaults_and_overrides() {
+        let config = load_config("{}\n", "thinking-sound-defaults").unwrap();
+        assert!(config.agent.thinking_sound.enabled);
+        assert_eq!(config.agent.thinking_sound.delay_s, 5.0);
+        assert_eq!(config.agent.thinking_sound.interval_s, 6.0);
+        assert_eq!(
+            config.device.thinking_sound_command,
+            "aplay -q /tmp/xiaoai-thinking.wav"
+        );
+
+        let config = load_config(
+            "agent:\n  thinking_sound:\n    enabled: false\n    delay_s: 3\n    interval_s: 8\n",
+            "thinking-sound-overrides",
+        )
+        .unwrap();
+        assert!(!config.agent.thinking_sound.enabled);
+        assert_eq!(config.agent.thinking_sound.delay_s, 3.0);
+        assert_eq!(config.agent.thinking_sound.interval_s, 8.0);
     }
 
     #[test]

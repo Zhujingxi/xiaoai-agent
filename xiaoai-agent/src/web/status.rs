@@ -123,6 +123,7 @@ impl RuntimeStatus {
         let voice_runtime = match config.voice.runtime {
             VoiceRuntime::Legacy => "legacy",
             VoiceRuntime::NativeQwen => "native_qwen",
+            VoiceRuntime::Hermes => "hermes",
         }
         .to_string();
         let asr_provider = match &config.asr.provider {
