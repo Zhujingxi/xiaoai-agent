@@ -5,11 +5,13 @@ set -e
 BASE_DIR=$(pwd)
 WORK_DIR=$BASE_DIR/temp
 
-FIRMWARE=$(basename $(ls $BASE_DIR/assets/*.bin 2>/dev/null | head -n 1) .bin)
+VERSION=$(cat "$BASE_DIR/assets/.version")
+FIRMWARE_PATH=$(find "$BASE_DIR/assets" -maxdepth 1 -type f -name "mico_all_*_${VERSION}.bin" -print -quit)
+FIRMWARE=$(basename "$FIRMWARE_PATH" .bin)
 
 cd $WORK_DIR
 
-if [ ! -f "$BASE_DIR/assets/$FIRMWARE.bin" ]; then
+if [ -z "$FIRMWARE_PATH" ] || [ ! -f "$FIRMWARE_PATH" ]; then
     echo "❌ 固件文件不存在，请先下载固件到：$BASE_DIR/assets/"
     exit 1
 fi
@@ -42,7 +44,9 @@ else
     exit 1
 fi
 
-if command -v gstat >/dev/null 2>&1; then
+if stat -L -c %s "$FIRMWARE/root-patched.squashfs" >/dev/null 2>&1; then
+    SIZE=$(stat -L -c %s "$FIRMWARE/root-patched.squashfs")
+elif command -v gstat >/dev/null 2>&1; then
     SIZE=$(gstat -L -c %s "$FIRMWARE/root-patched.squashfs")
 else
     SIZE=$(stat -f %z "$FIRMWARE/root-patched.squashfs")

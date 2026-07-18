@@ -2,3 +2,4 @@ temp
 assets/*
 !assets/.gitkeep
 .env
+.mi.json
